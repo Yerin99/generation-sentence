@@ -1,2 +1,6 @@
 /outputs
+
 /cache_joint
+/cache_gen
+
+*/__pycache__
