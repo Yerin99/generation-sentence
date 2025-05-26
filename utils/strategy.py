@@ -28,8 +28,11 @@ STRAT_TOKENS = [f"[STRAT_{s.replace(' ', '_')}]" for s in STRATEGIES]
 # ────────────────────────────────────────────────────────────────────────
 def get_token_id_map(tokenizer):
     """STRAT 토큰 id lookup (캐시)"""
+    # 토큰 → ID 변환
     ids = tokenizer.convert_tokens_to_ids(STRAT_TOKENS)
-    return {tid: i for i, tid in enumerate(ids)}
+    
+    # 올바른 매핑: 토큰 ID → 전략 인덱스
+    return {ids[i]: i for i in range(len(STRATEGIES))}
 
 def parse_strategy_from_ids(pred_ids: List[int],
                             tokenizer,
@@ -45,7 +48,7 @@ def parse_strategy_from_ids(pred_ids: List[int],
                 return tid2sid[tid]
         return None
     # ----- natural -----
-    txt = tokenizer.decode(pred_ids[1:30], skip_special_tokens=True)  # bos 제외
+    txt = safe_decode(pred_ids[1:30], tokenizer, skip_special_tokens=True)
     if ":" not in txt:
         return None
     prefix = txt.split(":", 1)[0].strip().lower()
@@ -67,3 +70,21 @@ def strip_strategy_prefix(text: str, mode: str) -> str:
         if ":" in text:
             text = text.split(":", 1)[1]
     return text.lstrip() 
+
+# ────────────────────────────────────────────────────────────────────────
+# util: 안전 디코딩
+# ────────────────────────────────────────────────────────────────────────
+def safe_decode(ids, tokenizer, skip_special_tokens=True) -> str:
+    """
+    tokenizer.decode 대체:
+    • OOV id 는 <unk> 로 치환
+    • skip_special_tokens 옵션 지원
+    """
+    unk_tok = tokenizer.unk_token or "<unk>"
+    tokens = []
+    for tid in ids:
+        if skip_special_tokens and tid in tokenizer.all_special_ids:
+            continue
+        tok = tokenizer._convert_id_to_token(int(tid))
+        tokens.append(tok if tok is not None else unk_tok)
+    return tokenizer.convert_tokens_to_string(tokens) 
