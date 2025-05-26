@@ -195,6 +195,30 @@ def bleu1_score(refs: List[str], gens: List[str]) -> float:
     return float(np.mean(scores))
 
 
+def safe_batch_decode(ids_array, tokenizer, skip_special_tokens=True):
+    """
+    • tokenizer.batch_decode 대체용
+    • out-of-vocab(id→None) 이면 <unk> 로 치환하여 TypeError 방지
+    """
+    outputs = []
+    unk_id  = tokenizer.unk_token_id
+    unk_tok = tokenizer.convert_ids_to_tokens([unk_id])[0]
+
+    for seq in ids_array:
+        tokens = []
+        for tid in seq:
+            # skip_special_tokens 옵션 반영
+            if skip_special_tokens and tid in tokenizer.all_special_ids:
+                continue
+            # id → token
+            tok = tokenizer._convert_id_to_token(int(tid))  # numpy → int 캐스팅
+            if tok is None:           # OOV 또는 잘못된 id
+                tok = unk_tok
+            tokens.append(tok)
+        outputs.append(tokenizer.convert_tokens_to_string(tokens))
+    return outputs
+
+
 # ===================== 메인 =====================
 def main():
     parser = argparse.ArgumentParser()
@@ -296,9 +320,9 @@ def main():
 
             # 1) 텍스트 메트릭
             gen_txt = [strip_strategy_prefix(t, args.strategy_mode)
-                       for t in tokenizer.batch_decode(preds,  skip_special_tokens=True)]
+                       for t in safe_batch_decode(preds, tokenizer, skip_special_tokens=True)]
             ref_txt = [strip_strategy_prefix(t, args.strategy_mode)
-                       for t in tokenizer.batch_decode(labels, skip_special_tokens=True)]
+                       for t in safe_batch_decode(labels, tokenizer, skip_special_tokens=True)]
             gen_m = generation_metrics(gen_txt, ref_txt)
 
             # 2) 전략 id 파싱 (실패 → Others 로 치환)
@@ -352,9 +376,9 @@ def main():
     lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
 
     gen_txt = [strip_strategy_prefix(t, args.strategy_mode)
-               for t in tokenizer.batch_decode(test_out.predictions, skip_special_tokens=True)]
+               for t in safe_batch_decode(test_out.predictions, tokenizer, skip_special_tokens=True)]
     ref_txt = [strip_strategy_prefix(t, args.strategy_mode)
-               for t in tokenizer.batch_decode(lbl_ids, skip_special_tokens=True)]
+               for t in safe_batch_decode(lbl_ids, tokenizer, skip_special_tokens=True)]
 
     gen_m = generation_metrics(gen_txt, ref_txt)
 
