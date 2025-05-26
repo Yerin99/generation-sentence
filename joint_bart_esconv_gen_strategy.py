@@ -134,8 +134,8 @@ class ESConvGenDataset(torch.utils.data.Dataset):
                             st_tok = f"[STRAT_{st.replace(' ', '_')}]"
                             ctx_parts.append(f"{SPECIAL_TOKENS['strategy']} {st_tok} {spk_tok} {prev['text']}")
                         else:  # natural
-                            st_tok = f"{prev.get('strategy','Others')}:"
-                            ctx_parts.append(f"{st_tok} {spk_tok} {prev['text']}")
+                            st_nat = f"{prev.get('strategy','Others')}:"
+                            ctx_parts.append(f"{st_nat} {spk_tok} {prev['text']}")
                     else:
                         ctx_parts.append(f"{spk_tok} {prev['text']}")
 
