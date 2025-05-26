@@ -183,29 +183,21 @@ class ESConvGenDataset(torch.utils.data.Dataset):
         return item
 
 
-# ===================== 메트릭 계산 도우미 =====================
-def safe_batch_decode(ids_array, tokenizer, skip_special_tokens=True):
-    """
-    • tokenizer.batch_decode 대체용
-    • out-of-vocab(id→None) 이면 <unk> 로 치환하여 TypeError 방지
-    """
-    outputs = []
-    unk_id  = tokenizer.unk_token_id
-    unk_tok = tokenizer.convert_ids_to_tokens([unk_id])[0]
-
-    for seq in ids_array:
-        tokens = []
-        for tid in seq:
-            # skip_special_tokens 옵션 반영
-            if skip_special_tokens and tid in tokenizer.all_special_ids:
-                continue
-            # id → token
-            tok = tokenizer._convert_id_to_token(int(tid))  # numpy → int 캐스팅
-            if tok is None:           # OOV 또는 잘못된 id
-                tok = unk_tok
-            tokens.append(tok)
-        outputs.append(tokenizer.convert_tokens_to_string(tokens))
-    return outputs
+# ===================== 유틸 함수 =====================
+def safe_batch_decode(ids, tokenizer, **kwargs):
+    """범위를 벗어난 ID를 UNK로 치환하여 안전하게 디코딩"""
+    # numpy 배열로 변환
+    ids_array = np.asarray(ids)
+    
+    # 범위를 벗어난 ID 마스킹 (음수 또는 어휘 크기 이상)
+    invalid_mask = (ids_array < 0) | (ids_array >= len(tokenizer))
+    
+    # 마스킹된 위치가 있으면 복사 후 UNK로 대체
+    if invalid_mask.any():
+        ids_array = ids_array.copy()
+        ids_array[invalid_mask] = tokenizer.unk_token_id
+        
+    return tokenizer.batch_decode(ids_array, **kwargs)
 
 
 # ===================== 메인 =====================
@@ -294,6 +286,7 @@ def main():
         logging_steps=args.eval_steps,
         predict_with_generate=True,
         generation_max_length=128,
+        generation_num_beams=5,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
@@ -356,9 +349,18 @@ def main():
     # --------------------- test split 평가 ---------------------
     logger.info("evaluating on test split …")
 
+    # 생성 파라미터 설정
+    gen_kwargs = {
+        "num_beams": 5,
+        "early_stopping": True,  # EOS 토큰 생성 시 중단
+        "no_repeat_ngram_size": 3,
+        "length_penalty": 1.0,  
+        "repetition_penalty": 1.2,
+    }
+
     # 1) loss/runtime 만 위해 metrics 잠시 비활성화
     trainer.compute_metrics = None
-    test_out = trainer.predict(test_ds, metric_key_prefix="test")
+    test_out = trainer.predict(test_ds, metric_key_prefix="test", **gen_kwargs)
 
     # 2) generation / strategy 메트릭 직접 계산
     lbl_ids = test_out.label_ids.copy()
@@ -413,10 +415,9 @@ def main():
         import textwrap
         for i in random.sample(range(len(train_ds)), args.show_samples):
             ex = train_ds[i]
-            ctx_plain = tokenizer.decode(ex["input_ids"], skip_special_tokens=True)
-            tgt_plain = tokenizer.decode([t if t != -100 else tokenizer.pad_token_id
-                                          for t in ex["labels"]],
-                                         skip_special_tokens=True)
+            ctx_plain = safe_batch_decode([ex["input_ids"]], tokenizer, skip_special_tokens=True)[0]
+            tgt_plain = safe_batch_decode([[t if t != -100 else tokenizer.pad_token_id for t in ex["labels"]]], 
+                                          tokenizer, skip_special_tokens=True)[0]
             logging.info(
                 "\n===== SAMPLE {:d} =====\n"
                 "CONTEXT:\n{}\n\nTARGET:\n{}\nstrategy_id: {}\n{}".format(
