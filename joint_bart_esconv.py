@@ -770,6 +770,41 @@ def main():
         with metrics_path.open("w", encoding="utf-8") as f:
             json.dump({k: float(v) for k, v in metrics.items()}, f, indent=2)
 
+        # 전략 분류 리포트 출력 - validation 데이터셋
+        logging.info("[main] computing strategy classification report for validation set...")
+        model.eval()
+        val_loader = torch.utils.data.DataLoader(
+            val_ds,  # 이미 존재하는 validation 데이터셋 사용
+            batch_size=args.batch_size,
+            collate_fn=data_collator,
+            shuffle=False,
+        )
+        val_sid_pred, val_sid_gt = [], []
+        device_eval = next(model.parameters()).device
+        with torch.no_grad():
+            for batch in val_loader:
+                sid_gt = batch.pop("strategy_id")
+                input_ids = batch["input_ids"].to(device_eval)
+                attention_mask = batch["attention_mask"].to(device_eval)
+                outs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outs.strategy_logits
+                sid_pred = torch.argmax(logits, dim=-1).cpu()
+                val_sid_pred.append(sid_pred)
+                val_sid_gt.append(sid_gt)
+
+        val_sid_pred = torch.cat(val_sid_pred).numpy()
+        val_sid_gt = torch.cat(val_sid_gt).numpy()
+
+        # 분류 리포트 출력
+        val_report = classification_report(
+            val_sid_gt, val_sid_pred,
+            labels=list(range(len(STRATEGIES))),
+            target_names=STRATEGIES,
+            digits=2,
+            zero_division=0
+        )
+        logging.info("\n=== Validation Strategy Classification Report ===\n" + val_report)
+
         # -------------------- TEST DATASET EVALUATION --------------------
         logging.info("[main] evaluating on test split …")
         test_ds = JointESConvDataset("test", tokenizer)
@@ -841,6 +876,16 @@ def main():
         test_path = Path(args.output_dir) / "test_metrics.json"
         with test_path.open("w", encoding="utf-8") as f:
             json.dump({k: float(v) for k, v in test_metrics.items()}, f, indent=2)
+
+        # 분류 리포트 출력
+        test_report = classification_report(
+            all_sid_gt, all_sid_pred,
+            labels=list(range(len(STRATEGIES))),
+            target_names=STRATEGIES,
+            digits=2,
+            zero_division=0
+        )
+        logging.info("\n=== Test Strategy Classification Report ===\n" + test_report)
 
         # 샘플 10개 저장 (validation 샘플 파일은 생성하지 않음)
         sample_n_test = min(10, len(gen_texts_full))
