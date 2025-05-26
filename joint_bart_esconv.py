@@ -17,24 +17,14 @@ ESConv 전략 예측 + 응답 생성 Joint-Decoding 파이프라인
 ----------
 # 1 GPU
 CUDA_VISIBLE_DEVICES=0 python joint_bart_esconv.py \
-    --epochs 10 --batch_size 16 --lambda_cls 0.2 \
+    --epochs 10 --batch_size 16 --lambda_cls 0.5 \
     --eval_steps 500 --clean_checkpoints \
     --output_dir outputs/joint
 
-# 4 GPU
-torchrun --standalone --nproc_per_node=4 joint_bart_esconv.py \
-    --epochs 5 --batch_size 8 --lambda_cls 0.5 \
-    --output_dir outputs/joint
-
 # 1GPU, tiny check
-CUDA_VISIBLE_DEVICES=0 python joint_bart_esconv.py \
-        --epochs 1 --batch_size 4 --tiny_frac 0.01 \
+CUDA_VISIBLE_DEVICES=1 python joint_bart_esconv.py \
+        --epochs 3 --batch_size 4 --tiny_frac 0.01 --lambda_cls 1.0 \
         --eval_steps 10 --clean_checkpoints --output_dir outputs/sanity1gpu
-
-# 4GPU, 충분히 큰 tiny_frac
-torchrun --standalone --nproc_per_node=4 joint_bart_esconv.py \
-        --epochs 1 --batch_size 8 --tiny_frac 0.05 \
-        --output_dir outputs/sanity4gpu
 """
 from __future__ import annotations
 
@@ -347,6 +337,14 @@ def generation_metrics(preds: list[str], refs: list[str]):
         "meteor": meteor,
         "cider": cider,
     }
+
+
+def calculate_perplexity(loss):
+    """
+    손실값(cross-entropy loss)에서 perplexity 계산
+    PPL = exp(평균 negative log likelihood) = exp(loss)
+    """
+    return float(np.exp(loss))
 
 # ============================== trainer ==============================================
 class JointTrainer(Seq2SeqTrainer):
@@ -766,6 +764,12 @@ def main():
 
         # validation metrics dump
         metrics = trainer.evaluate()
+        
+        # 손실값에서 PPL 계산 추가
+        if "eval_loss" in metrics:
+            metrics["eval_perplexity"] = calculate_perplexity(metrics["eval_loss"])
+            logging.info(f"Validation Perplexity: {metrics['eval_perplexity']:.4f}")
+            
         metrics_path = Path(args.output_dir) / "val_metrics.json"
         with metrics_path.open("w", encoding="utf-8") as f:
             json.dump({k: float(v) for k, v in metrics.items()}, f, indent=2)
@@ -824,6 +828,11 @@ def main():
 
         # 1) loss 등 기본 메트릭
         test_metrics = trainer.evaluate(test_ds, metric_key_prefix="test")
+
+        # 손실값에서 PPL 계산 추가
+        if "test_loss" in test_metrics:
+            test_metrics["test_perplexity"] = calculate_perplexity(test_metrics["test_loss"])
+            logging.info(f"Test Perplexity: {test_metrics['test_perplexity']:.4f}")
 
         # 2) 추가 메트릭 계산
         logging.info("[main] computing generation & strategy metrics on test …")
