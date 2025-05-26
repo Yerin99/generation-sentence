@@ -8,11 +8,11 @@ joint_bart_esconv_gen_strategy.py
 ----------
 # 자연어 전략 프리픽스
 CUDA_VISIBLE_DEVICES=2 python joint_bart_esconv_gen_strategy.py \
-    --strategy_mode natural --epochs 10 --output_dir outputs/natural
+    --strategy_mode natural --ctx_strategy_rep natural --epochs 10 --output_dir outputs/natural
 
 # 특수 토큰 전략 프리픽스
 CUDA_VISIBLE_DEVICES=3 python joint_bart_esconv_gen_strategy.py \
-    --strategy_mode token --epochs 10 --output_dir outputs/token
+    --strategy_mode token --ctx_strategy_rep token --epochs 10 --output_dir outputs/token
 
 # 자연어 전략 + tiny 1% + patience 2
 CUDA_VISIBLE_DEVICES=2 python joint_bart_esconv_gen_strategy.py \
