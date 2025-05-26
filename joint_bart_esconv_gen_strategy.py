@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-joint_bart_esconv_decoder.py
+joint_bart_esconv_gen_strategy.py
 ============================
 디코더 첫 토큰으로 '전략'을 **생성**(natural phrase 또는 특수 토큰) 하는 ESConv 파이프라인.
 
 사용법 예시
 ----------
 # 자연어 전략 프리픽스
-CUDA_VISIBLE_DEVICES=0 python joint_bart_esconv_gen_strategy.py \
+CUDA_VISIBLE_DEVICES=2 python joint_bart_esconv_gen_strategy.py \
     --strategy_mode natural --epochs 10 --output_dir outputs/natural
 
 # 특수 토큰 전략 프리픽스
-CUDA_VISIBLE_DEVICES=1 python joint_bart_esconv_gen_strategy.py \
+CUDA_VISIBLE_DEVICES=3 python joint_bart_esconv_gen_strategy.py \
     --strategy_mode token --epochs 10 --output_dir outputs/token
 
 # 자연어 전략 + tiny 1% + patience 2
@@ -64,13 +64,14 @@ logger = logging.getLogger("joint_dec")
 def build_prefix(strategy_id: int, mode: str) -> str:
     """
     전략 id → 프리픽스 문자열 반환.
-      - mode == "natural" : "Providing Suggestions: "
-      - mode == "token"   : "[STRAT_Providing_Suggestions] "
+      - mode == "natural" : "Providing Suggestions: [SYS]"
+      - mode == "token"   : "[STRAT_Providing_Suggestions] [SYS]"
     """
+    sys_token = SPECIAL_TOKENS["sys"]
     if mode == "natural":
-        return f"{ID2STR[strategy_id]}: "
+        return f"{ID2STR[strategy_id]}: {sys_token} "
     else:
-        return f"{STRAT_TOKENS[strategy_id]} "
+        return f"{STRAT_TOKENS[strategy_id]} {sys_token} "
 
 
 # ===================== 데이터셋 =====================
