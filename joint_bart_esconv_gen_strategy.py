@@ -184,18 +184,6 @@ class ESConvGenDataset(torch.utils.data.Dataset):
 
 
 # ===================== 메트릭 계산 도우미 =====================
-def bleu1_score(refs: List[str], gens: List[str]) -> float:
-    """Sentence-BLEU1 평균(간단)."""
-    from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-
-    smoothie = SmoothingFunction().method1
-    scores = [
-        sentence_bleu([r.split()], g.split(), weights=(1, 0, 0, 0), smoothing_function=smoothie)
-        for r, g in zip(refs, gens)
-    ]
-    return float(np.mean(scores))
-
-
 def safe_batch_decode(ids_array, tokenizer, skip_special_tokens=True):
     """
     • tokenizer.batch_decode 대체용
