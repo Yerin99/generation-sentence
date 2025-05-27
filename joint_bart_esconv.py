@@ -18,13 +18,13 @@ ESConv 전략 예측 + 응답 생성 Joint-Decoding 파이프라인
 # 1 GPU
 CUDA_VISIBLE_DEVICES=0 python joint_bart_esconv.py \
     --epochs 10 --batch_size 16 --lambda_cls 0.5 \
-    --eval_steps 500 --clean_checkpoints \
+    --clean_checkpoints \
     --output_dir outputs/joint
 
 # 1GPU, tiny check
 CUDA_VISIBLE_DEVICES=1 python joint_bart_esconv.py \
         --epochs 3 --batch_size 4 --tiny_frac 0.01 --lambda_cls 1.0 \
-        --eval_steps 10 --clean_checkpoints --output_dir outputs/sanity1gpu
+        --clean_checkpoints --output_dir outputs/sanity1gpu
 """
 from __future__ import annotations
 
@@ -357,6 +357,10 @@ class JointTrainer(Seq2SeqTrainer):
         if tok is not None and "processing_class" not in kwargs:
             kwargs["processing_class"] = tok  # 신버전 Trainer 가 권장하는 필드
         
+        # 클래스 메서드를 compute_metrics로 설정 (중요: 기존에 전달된 것이 없을 때만)
+        if 'compute_metrics' not in kwargs or kwargs['compute_metrics'] is None:
+            kwargs['compute_metrics'] = self.compute_metrics
+        
         # Best 모델 추적 변수
         self.best_metric = float("inf")  # eval_loss는 낮을수록 좋음
         self.best_model_dir = os.path.join(kwargs.get("args").output_dir, "best_model")
@@ -364,48 +368,80 @@ class JointTrainer(Seq2SeqTrainer):
         self.metric_for_best_model = kwargs.get("args").metric_for_best_model
         self.greater_is_better = kwargs.get("args").greater_is_better
         
+        import logging
+        self.logger = logging.getLogger("joint")
+        
         super().__init__(*args, **kwargs)
-
+        
         # metric 계산용 캐시 초기화
         self.strategy_logits_cache: list[np.ndarray] = []
         self.sid_cache: list[np.ndarray] = []
 
-    def compute_metrics(self, eval_pred):  # type: ignore
+    def compute_metrics(self, eval_pred):
+        """텍스트 생성 및 전략 분류 메트릭 계산"""
+        import logging
+        logger = logging.getLogger("joint")
+        
         preds, labels = eval_pred.predictions, eval_pred.label_ids
-
-        # processing_class 가 새 권장 필드 – 존재 시 우선 사용
+        
+        # tokenizer 가져오기
         tok = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
-
-        # generation ids -> text
-        preds_txt = tok.batch_decode(preds, skip_special_tokens=True)
-        lbl = labels.copy()
-        lbl[lbl == -100] = tok.pad_token_id
-        refs_txt = tok.batch_decode(lbl, skip_special_tokens=True)
-
-        gen_m = generation_metrics(preds_txt, refs_txt)
-
-        # strategy metrics (acc/f1) – 캐시가 있을 때만 계산
+        
+        # 기본 메트릭 초기화
+        metrics = {}
+        
+        # PPL 계산
+        if hasattr(eval_pred, 'metrics') and 'eval_loss' in eval_pred.metrics:
+            metrics['eval_perplexity'] = calculate_perplexity(eval_pred.metrics['eval_loss'])
+        
+        # 생성 메트릭 계산 (predict_with_generate=True 필요)
+        if isinstance(preds, np.ndarray) and preds.ndim > 1:
+            try:
+                # 안전한 디코딩을 위해 safe_batch_decode 사용
+                preds_txt = safe_batch_decode(tok, preds)
+                lbl = labels.copy()
+                lbl[lbl == -100] = tok.pad_token_id
+                refs_txt = safe_batch_decode(tok, lbl)
+                
+                # 생성 메트릭 계산 및 추가
+                gen_m = generation_metrics(preds_txt, refs_txt)
+                metrics.update(gen_m)
+                
+            except Exception as e:
+                logger.warning(f"생성 메트릭 계산 중 오류 발생: {e}")
+                # 기본값으로 0 설정
+                metrics.update({
+                    "bleu1": 0.0, "bleu2": 0.0, "bleu3": 0.0, "bleu4": 0.0,
+                    "rouge_l": 0.0, "meteor": 0.0, "cider": 0.0
+                })
+        
+        # strategy metrics 계산
         if len(self.strategy_logits_cache) > 0:
             logits = np.concatenate(self.strategy_logits_cache, axis=0)
             sid_gt = np.concatenate(self.sid_cache, axis=0)
             sid_pred = np.argmax(logits, axis=1)
             acc = accuracy_score(sid_gt, sid_pred)
             f1 = f1_score(sid_gt, sid_pred, average="weighted")
-            gen_m.update({"strategy_accuracy": acc, "strategy_f1": f1})
-
+            metrics.update({"strategy_accuracy": acc, "strategy_f1": f1})
+            
             # 다음 평가를 위해 캐시 정리
             self.strategy_logits_cache.clear()
             self.sid_cache.clear()
         
+        # BLEU-1과 strategy_accuracy가 있다면 로그 출력
+        if "bleu1" in metrics and "strategy_accuracy" in metrics:
+            # epoch 정보가 있으면 함께 출력
+            epoch_info = f"Epoch {self.state.epoch:.2f}" if hasattr(self.state, "epoch") else "Evaluation"
+            logger.info(
+                f"📊 {epoch_info} 메트릭: BLEU-1={metrics['bleu1']:.4f}, "
+                f"Strategy Accuracy={metrics['strategy_accuracy']:.4f}"
+            )
+        
         # ----------------------- Best Model 관리 로직 ----------------------
         # 매 evaluation마다 metric을 확인하고 best model이 발견되면 즉시 저장
-        current_metric = gen_m.get(self.metric_for_best_model, None)
+        current_metric = metrics.get(self.metric_for_best_model, None)
         
         # 항상 현재 best model 저장 (첫 eval에서는 무조건 best)
-        import logging, os
-        logger = logging.getLogger("joint")
-        
-        # current_metric이 없으면 첫 번째 평가로 간주하고 best로 저장
         if current_metric is None:
             logger.info(f"첫 번째 eval 결과, 모델 저장 (metric 없음)")
             self._save_best_model()
@@ -430,7 +466,7 @@ class JointTrainer(Seq2SeqTrainer):
                     self._save_best_model()
         # ---------------------------------------------------------------------
 
-        return gen_m
+        return metrics
 
     # custom caches
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):  # type: ignore
@@ -598,8 +634,7 @@ def main():
     ap.add_argument("--output_dir", type=str, default="runs/joint")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--tiny_frac", type=float, default=None, help="데이터셋의 일부만 사용 (e.g., 0.01 = 1%)")
-    ap.add_argument("--patience", type=int, default=5, help="early stopping patience (number of evals without improvement)")
-    ap.add_argument("--eval_steps", type=int, default=500, help="평가 주기 (스텝 단위)")
+    ap.add_argument("--patience", type=int, default=3, help="early stopping patience (number of epochs without improvement)")
     ap.add_argument("--clean_checkpoints", action="store_true", help="학습 완료 후 체크포인트 폴더 정리")
     args = ap.parse_args()
 
@@ -639,10 +674,8 @@ def main():
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         learning_rate=args.lr,
-        eval_strategy="steps",
-        eval_steps=args.eval_steps,
-        save_strategy="steps",
-        save_steps=args.eval_steps,
+        eval_strategy="epoch",
+        save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
@@ -685,7 +718,7 @@ def main():
                 return
                 
             # 저장 로직
-            logging.info(f"새로운 Best 모델 발견 ({metric_to_check}={metric_value}), 저장합니다.")
+            logger.info(f"새로운 Best 모델 발견 ({metric_to_check}={metric_value}), 저장합니다.")
             trainer.best_metric = metric_value
             trainer.save_model(trainer.best_model_dir)
             
@@ -914,15 +947,31 @@ def safe_batch_decode(tokenizer: BartTokenizer, predictions):
     """토크나이저 오류(NoneType) 방지를 위해 id 범위를 검사하며 디코드."""
     texts: list[str] = []
     vocab_size = len(tokenizer)
+    
     for seq in predictions:
-        # seq 가 numpy array / list / torch 텐서 모두 지원
-        if isinstance(seq, torch.Tensor):
-            seq = seq.tolist()
-        elif isinstance(seq, np.ndarray):
-            seq = seq.tolist()
-        # id 범위 밖 값 or None 을 unk 토큰으로 대체
-        clean_ids = [int(t) if isinstance(t, (int, np.integer)) and 0 <= int(t) < vocab_size else tokenizer.unk_token_id for t in seq]
-        texts.append(tokenizer.decode(clean_ids, skip_special_tokens=True))
+        try:
+            # seq 가 numpy array / list / torch 텐서 모두 지원
+            if isinstance(seq, torch.Tensor):
+                seq = seq.tolist()
+            elif isinstance(seq, np.ndarray):
+                seq = seq.tolist()
+                
+            # id 범위 밖 값, None, 또는 비정수값을 unk 토큰으로 대체
+            clean_ids = []
+            for t in seq:
+                if isinstance(t, (int, np.integer)) and 0 <= int(t) < vocab_size:
+                    clean_ids.append(int(t))
+                else:
+                    clean_ids.append(tokenizer.unk_token_id)
+                    
+            text = tokenizer.decode(clean_ids, skip_special_tokens=True)
+            texts.append(text)
+            
+        except Exception as e:
+            # 디코딩 실패 시 빈 문자열 추가
+            texts.append("")
+            logging.warning(f"토큰 디코딩 실패: {e}")
+            
     return texts
 
 if __name__ == "__main__":
