@@ -242,6 +242,8 @@ class JointBart(nn.Module):
 
         # ---------------- 3) Decoder embedding 구성 -----------------
         # token id → embedding
+        # BART 모델은 인코더와 디코더가 동일한 토큰 임베딩(nn.Embedding)을 공유
+        # 공유 임베딩 레이어가 바로 model.shared
         dec_emb = self.model.model.shared(decoder_input_ids)  # (B, L, d_model)
 
         # placeholder 위치는 항상 index 1 (BOS 뒤)
