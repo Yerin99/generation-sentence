@@ -8,10 +8,12 @@ joint_bart_esconv_gen_strategy.py
 ----------
 # 자연어 전략 프리픽스
 CUDA_VISIBLE_DEVICES=2 python joint_bart_esconv_gen_strategy.py \
+    --eval_init \
     --strategy_mode natural --ctx_strategy_rep natural --epochs 10 --output_dir outputs/natural
 
 # 특수 토큰 전략 프리픽스
 CUDA_VISIBLE_DEVICES=3 python joint_bart_esconv_gen_strategy.py \
+    --eval_init \
     --strategy_mode token --ctx_strategy_rep token --epochs 10 --output_dir outputs/token
 
 # 자연어 전략 + tiny 1% + patience 2
@@ -218,6 +220,10 @@ def main():
     parser.add_argument("--ctx_strategy_rep", choices=["token", "natural", "none"], 
                         default="token",
                         help="과거 system 턴에 전략을 어떻게 표기할지")
+    parser.add_argument("--eval_init", action="store_true", 
+                        help="학습 전 초기 모델(epoch 0)에서 평가 수행")
+    parser.add_argument("--eval_only", action="store_true",
+                        help="학습 없이 평가만 수행")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -364,79 +370,165 @@ def main():
         callbacks=[EarlyStoppingCallback(early_stopping_patience=args.patience)],
     )
 
-    trainer.train()
-    trainer.save_model(args.output_dir)
+    # --------------------- 초기 모델(epoch 0) 평가 ---------------------
+    if args.eval_init or args.eval_only:
+        logger.info("📊 Evaluating initial model (epoch 0) ...")
+        
+        # 검증 데이터셋 평가
+        init_eval = trainer.evaluate()
+        
+        # 결과 저장
+        init_path = Path(args.output_dir) / "init_eval_metrics.json"
+        init_path.parent.mkdir(exist_ok=True, parents=True)
+        with init_path.open("w", encoding="utf-8") as f:
+            json.dump({k: float(v) for k, v in init_eval.items()}, f, indent=2)
+        
+        # 테스트 데이터셋 평가
+        logger.info("📊 Evaluating initial model on test split ...")
+        
+        # 생성 파라미터
+        gen_kwargs = {
+            "num_beams": 5,
+            "early_stopping": True,
+            "no_repeat_ngram_size": 3,
+            "length_penalty": 1.0,
+            "repetition_penalty": 1.2,
+        }
+        
+        # 테스트셋 평가
+        test_out = trainer.predict(test_ds, metric_key_prefix="init_test", **gen_kwargs)
+        
+        # PPL 계산
+        test_loss = test_out.metrics.get('init_test_loss', 0)
+        test_ppl = calculate_perplexity(test_loss)
+        logger.info(f"Initial Test Perplexity: {test_ppl:.4f}")
+        
+        # 텍스트 생성 메트릭 계산
+        lbl_ids = test_out.label_ids.copy()
+        lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
+        
+        gen_txt = [strip_strategy_prefix(t, args.strategy_mode)
+                for t in safe_batch_decode(test_out.predictions, tokenizer, skip_special_tokens=True)]
+        ref_txt = [strip_strategy_prefix(t, args.strategy_mode)
+                for t in safe_batch_decode(lbl_ids, tokenizer, skip_special_tokens=True)]
+        
+        gen_m = generation_metrics(gen_txt, ref_txt)
+        
+        # 전략 메트릭 계산
+        sid_pred, sid_gt = [], []
+        for g_ids, ex in zip(test_out.predictions, test_ds.examples):
+            sid = parse_strategy_from_ids(g_ids, tokenizer, args.strategy_mode)
+            if sid is None:
+                sid = STR2ID["Others"]
+            sid_pred.append(sid)
+            sid_gt.append(ex["strategy_id"])
+        
+        gen_m = add_strategy_metrics(gen_m, sid_pred, sid_gt)
+        
+        # 메트릭 저장
+        init_test_m = {f"init_test_{k}": v for k, v in gen_m.items()}
+        init_test_m.update(test_out.metrics)
+        init_test_m['init_test_perplexity'] = test_ppl
+        
+        # 분류 리포트
+        from sklearn.metrics import classification_report
+        init_report = classification_report(
+            sid_gt, sid_pred,
+            labels=list(range(len(STRATEGIES))),
+            target_names=STRATEGIES,
+            digits=2,
+            zero_division=0
+        )
+        logger.info("\n=== Initial Test Strategy Classification Report ===\n" + init_report)
+        
+        # 저장
+        init_test_path = Path(args.output_dir) / "init_test_metrics.json"
+        with init_test_path.open("w", encoding="utf-8") as f:
+            json.dump({k: float(v) for k, v in init_test_m.items()}, f, indent=2)
+        
+        logger.info(f"📝 Saved initial model metrics to {args.output_dir}")
+        
+        # 샘플 저장
+        sample_n = min(10, len(gen_txt))
+        with open(Path(args.output_dir) / "init_samples.txt", "w", encoding="utf-8") as f:
+            for ref, gen in zip(ref_txt[:sample_n], gen_txt[:sample_n]):
+                f.write(f"REF: {ref}\nGEN: {gen}\n---\n")
+    
+    # 학습 수행 (eval_only가 True면 학습 건너뜀)
+    if not args.eval_only:
+        trainer.train()
+        trainer.save_model(args.output_dir)
+        
+        # --------------------- test split 평가 ---------------------
+        logger.info("evaluating on test split …")
 
-    # --------------------- test split 평가 ---------------------
-    logger.info("evaluating on test split …")
+        # 생성 파라미터 설정
+        gen_kwargs = {
+            "num_beams": 5,
+            "early_stopping": True,  # EOS 토큰 생성 시 중단
+            "no_repeat_ngram_size": 3,
+            "length_penalty": 1.0,  
+            "repetition_penalty": 1.2,
+        }
 
-    # 생성 파라미터 설정
-    gen_kwargs = {
-        "num_beams": 5,
-        "early_stopping": True,  # EOS 토큰 생성 시 중단
-        "no_repeat_ngram_size": 3,
-        "length_penalty": 1.0,  
-        "repetition_penalty": 1.2,
-    }
+        # 1) loss/runtime 만 위해 metrics 잠시 비활성화
+        trainer.compute_metrics = None
+        test_out = trainer.predict(test_ds, metric_key_prefix="test", **gen_kwargs)
 
-    # 1) loss/runtime 만 위해 metrics 잠시 비활성화
-    trainer.compute_metrics = None
-    test_out = trainer.predict(test_ds, metric_key_prefix="test", **gen_kwargs)
+        # PPL 계산 추가
+        test_loss = test_out.metrics.get('test_loss', 0)
+        test_ppl = calculate_perplexity(test_loss)
+        logger.info(f"Test Perplexity: {test_ppl:.4f}")
 
-    # PPL 계산 추가
-    test_loss = test_out.metrics.get('test_loss', 0)
-    test_ppl = calculate_perplexity(test_loss)
-    logger.info(f"Test Perplexity: {test_ppl:.4f}")
+        # 2) generation / strategy 메트릭 직접 계산
+        lbl_ids = test_out.label_ids.copy()
+        lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
 
-    # 2) generation / strategy 메트릭 직접 계산
-    lbl_ids = test_out.label_ids.copy()
-    lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
+        gen_txt = [strip_strategy_prefix(t, args.strategy_mode)
+                   for t in safe_batch_decode(test_out.predictions, tokenizer, skip_special_tokens=True)]
+        ref_txt = [strip_strategy_prefix(t, args.strategy_mode)
+                   for t in safe_batch_decode(lbl_ids, tokenizer, skip_special_tokens=True)]
 
-    gen_txt = [strip_strategy_prefix(t, args.strategy_mode)
-               for t in safe_batch_decode(test_out.predictions, tokenizer, skip_special_tokens=True)]
-    ref_txt = [strip_strategy_prefix(t, args.strategy_mode)
-               for t in safe_batch_decode(lbl_ids, tokenizer, skip_special_tokens=True)]
+        gen_m = generation_metrics(gen_txt, ref_txt)
 
-    gen_m = generation_metrics(gen_txt, ref_txt)
+        sid_pred, sid_gt = [], []
+        for g_ids, ex in zip(test_out.predictions, test_ds.examples):
+            sid = parse_strategy_from_ids(g_ids, tokenizer, args.strategy_mode)
+            if sid is None:                     # 미검출 → Others
+                sid = STR2ID["Others"]
+            sid_pred.append(sid)
+            sid_gt.append(ex["strategy_id"])
 
-    sid_pred, sid_gt = [], []
-    for g_ids, ex in zip(test_out.predictions, test_ds.examples):
-        sid = parse_strategy_from_ids(g_ids, tokenizer, args.strategy_mode)
-        if sid is None:                     # 미검출 → Others
-            sid = STR2ID["Others"]
-        sid_pred.append(sid)
-        sid_gt.append(ex["strategy_id"])
+        gen_m = add_strategy_metrics(gen_m, sid_pred, sid_gt)
 
-    gen_m = add_strategy_metrics(gen_m, sid_pred, sid_gt)
+        # 3) key 에 test_ 접두사 부여 → 중복 제거
+        test_m = {f"test_{k}": v for k, v in gen_m.items()}
+        test_m.update(test_out.metrics)         # test_loss, test_runtime 등만 추가
+        test_m['test_perplexity'] = test_ppl    # PPL 추가
 
-    # 3) key 에 test_ 접두사 부여 → 중복 제거
-    test_m = {f"test_{k}": v for k, v in gen_m.items()}
-    test_m.update(test_out.metrics)         # test_loss, test_runtime 등만 추가
-    test_m['test_perplexity'] = test_ppl    # PPL 추가
+        # 4) 분류 리포트 로그
+        from sklearn.metrics import classification_report
+        rep = classification_report(
+            sid_gt, sid_pred,
+            labels=list(range(len(STRATEGIES))),
+            target_names=STRATEGIES,
+            digits=2,
+            zero_division=0
+        )
+        logger.info("\n" + rep)
 
-    # 4) 분류 리포트 로그
-    from sklearn.metrics import classification_report
-    rep = classification_report(
-        sid_gt, sid_pred,
-        labels=list(range(len(STRATEGIES))),
-        target_names=STRATEGIES,
-        digits=2,
-        zero_division=0
-    )
-    logger.info("\n" + rep)
+        # 5) 저장
+        Path(args.output_dir).mkdir(exist_ok=True, parents=True)
+        with open(Path(args.output_dir) / "test_metrics.json", "w") as f:
+            json.dump({k: float(v) for k, v in test_m.items()}, f, indent=2)
 
-    # 5) 저장
-    Path(args.output_dir).mkdir(exist_ok=True, parents=True)
-    with open(Path(args.output_dir) / "test_metrics.json", "w") as f:
-        json.dump({k: float(v) for k, v in test_m.items()}, f, indent=2)
+        # 샘플 10개 저장
+        sample_n = min(10, len(gen_txt))
+        with open(Path(args.output_dir) / "samples.txt", "w", encoding="utf-8") as f:
+            for ref, gen in zip(ref_txt[:sample_n], gen_txt[:sample_n]):
+                f.write(f"REF: {ref}\nGEN: {gen}\n---\n")
 
-    # 샘플 10개 저장
-    sample_n = min(10, len(gen_txt))
-    with open(Path(args.output_dir) / "samples.txt", "w", encoding="utf-8") as f:
-        for ref, gen in zip(ref_txt[:sample_n], gen_txt[:sample_n]):
-            f.write(f"REF: {ref}\nGEN: {gen}\n---\n")
-
-    logger.info(f"saved model & test metrics to {args.output_dir}")
+        logger.info(f"saved model & test metrics to {args.output_dir}")
 
     if args.show_samples:
         import textwrap
