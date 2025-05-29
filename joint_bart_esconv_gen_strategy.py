@@ -295,17 +295,32 @@ def main():
     )
 
     # -------- metric fn --------
+    def calculate_perplexity(loss):
+        """
+        Cross-entropy loss에서 perplexity 계산
+        PPL = exp(loss)
+        """
+        return np.exp(loss)
+
     def build_compute_metrics(eval_dataset):
         def compute_metrics(eval_pred):
             preds, labels = eval_pred
             labels[labels == -100] = tokenizer.pad_token_id
 
+            # 기본 메트릭 초기화
+            metrics = {}
+            
+            # PPL 계산 추가
+            if hasattr(eval_pred, 'metrics') and 'eval_loss' in eval_pred.metrics:
+                metrics['perplexity'] = calculate_perplexity(eval_pred.metrics['eval_loss'])
+            
             # 1) 텍스트 메트릭
             gen_txt = [strip_strategy_prefix(t, args.strategy_mode)
                        for t in safe_batch_decode(preds, tokenizer, skip_special_tokens=True)]
             ref_txt = [strip_strategy_prefix(t, args.strategy_mode)
                        for t in safe_batch_decode(labels, tokenizer, skip_special_tokens=True)]
             gen_m = generation_metrics(gen_txt, ref_txt)
+            metrics.update(gen_m)  # 이렇게 변경
 
             # 2) 전략 id 파싱 (실패 → Others 로 치환)
             sid_pred, sid_gt = [], []
@@ -315,7 +330,7 @@ def main():
                     sid = STR2ID["Others"]
                 sid_pred.append(sid)
                 sid_gt.append(ex["strategy_id"])
-            gen_m = add_strategy_metrics(gen_m, sid_pred, sid_gt)
+            gen_m = add_strategy_metrics(metrics, sid_pred, sid_gt)  # 여기서 metrics로 변경
 
             # 3) classification_report 로그 (labels 명시, zero_division 방지)
             from sklearn.metrics import classification_report
@@ -328,7 +343,13 @@ def main():
                 zero_division=0
             )
             logging.info("\n" + report)
-            return gen_m
+            
+            # PPL을 포함한 주요 메트릭 로깅
+            if 'perplexity' in metrics:
+                logging.info(f"📊 Eval Metrics: PPL={metrics['perplexity']:.4f}, BLEU-1={metrics['bleu1']:.4f}, "
+                            f"Strategy Accuracy={metrics['strategy_accuracy']:.4f}")
+            
+            return metrics
         return compute_metrics
 
     # -------- trainer --------
@@ -362,6 +383,11 @@ def main():
     trainer.compute_metrics = None
     test_out = trainer.predict(test_ds, metric_key_prefix="test", **gen_kwargs)
 
+    # PPL 계산 추가
+    test_loss = test_out.metrics.get('test_loss', 0)
+    test_ppl = calculate_perplexity(test_loss)
+    logger.info(f"Test Perplexity: {test_ppl:.4f}")
+
     # 2) generation / strategy 메트릭 직접 계산
     lbl_ids = test_out.label_ids.copy()
     lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
@@ -386,6 +412,7 @@ def main():
     # 3) key 에 test_ 접두사 부여 → 중복 제거
     test_m = {f"test_{k}": v for k, v in gen_m.items()}
     test_m.update(test_out.metrics)         # test_loss, test_runtime 등만 추가
+    test_m['test_perplexity'] = test_ppl    # PPL 추가
 
     # 4) 분류 리포트 로그
     from sklearn.metrics import classification_report
