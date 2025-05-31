@@ -16,13 +16,13 @@ CUDA_VISIBLE_DEVICES=3 python joint_bart_esconv_gen_strategy.py \
     --eval_init \
     --strategy_mode token --ctx_strategy_rep token --epochs 10 --output_dir outputs/token
 
-# 자연어 전략 + tiny 1% + patience 2
+# 자연어 전략 + tiny 1% + patience 3
 CUDA_VISIBLE_DEVICES=2 python joint_bart_esconv_gen_strategy.py \
     --strategy_mode natural --tiny_frac 0.01 --epochs 1\
     --eval_steps 10 --patience 3 --ctx_strategy_rep natural\
     --output_dir outputs/tiny_natural
 
-# 특수 토큰 전략 + tiny 1% + patience 2
+# 특수 토큰 전략 + tiny 1% + patience 3
 CUDA_VISIBLE_DEVICES=3 python joint_bart_esconv_gen_strategy.py \
     --strategy_mode token --tiny_frac 0.01 --epochs 1 \
     --eval_steps 10 --patience 3 --ctx_strategy_rep token\
@@ -50,7 +50,9 @@ from utils.metrics import generation_metrics, add_strategy_metrics
 from utils.strategy import (
     STRATEGIES, STR2ID, ID2STR, STRAT_TOKENS,
     parse_strategy_from_ids, strip_strategy_prefix,
+    to_refined, safe_decode,
 )
+from tokenizers import AddedToken   # NEW (slow-tokenizer 사용 시 무시돼도 안전)
 
 # ===================== 전역 정의 =====================
 SPECIAL_TOKENS = {          # 대화 문맥용 역할 토큰
@@ -107,7 +109,7 @@ class ESConvGenDataset(torch.utils.data.Dataset):
 
         cache_f = (
             Path(cache_dir)
-            / f"{split}_{self.mode}_{max_src}_{max_tgt}_{tiny_frac}.pt"
+            / f"{split}_{self.mode}_{max_src}_{max_tgt}_{tiny_frac}_refined.pt"
         )
         cache_f.parent.mkdir(exist_ok=True, parents=True)
         if cache_f.exists():
@@ -120,7 +122,9 @@ class ESConvGenDataset(torch.utils.data.Dataset):
             for turn in dialog:
                 if turn["speaker"] != "sys":
                     continue
-                sid = STR2ID.get(turn.get("strategy", "Others"), STR2ID["Others"])
+                cur_orig = turn.get("strategy", "Others")
+                cur_ref  = to_refined(cur_orig)
+                sid      = STR2ID.get(cur_ref, STR2ID["Others"])
 
                 # ---------- encoder input ----------
                 ctx_parts: List[str] = []
@@ -131,12 +135,14 @@ class ESConvGenDataset(torch.utils.data.Dataset):
 
                     # --- 과거 system 턴 전략 표시 ---
                     if prev["speaker"] == "sys" and self.ctx_rep != "none":
+                        prev_orig = prev.get("strategy", "Others")
+                        prev_ref = to_refined(prev_orig)
+
                         if self.ctx_rep == "token":
-                            st = prev.get("strategy", "Others")
-                            st_tok = f"[STRAT_{st.replace(' ', '_')}]"
+                            st_tok = f"[STRAT_{prev_ref.replace(' ', '_')}]"
                             ctx_parts.append(f"{spk_tok} {SPECIAL_TOKENS['strategy']} {st_tok} {prev['text']}")
                         else:  # natural
-                            st_nat = f"{prev.get('strategy','Others')}:"
+                            st_nat = f"{prev_ref}:"
                             ctx_parts.append(f"{spk_tok} {st_nat} {prev['text']}")
                     else:
                         ctx_parts.append(f"{spk_tok} {prev['text']}")
@@ -144,16 +150,28 @@ class ESConvGenDataset(torch.utils.data.Dataset):
                 context = " ".join(ctx_parts)
 
                 # ---------- decoder label ----------
-                prefix = build_prefix(sid, self.mode)    # 자연어 or 토큰
+                prefix = build_prefix(sid, self.mode)
                 tgt_text = prefix + turn["text"]
 
-                self.examples.append(
-                    {
-                        "context": context,
-                        "target": tgt_text,
-                        "strategy_id": sid,
-                    }
-                )
+                # ---------- tokenization ----------
+                enc = self.tok(context,
+                               max_length=self.max_src,
+                               truncation=True,
+                               padding="max_length")
+                dec = self.tok(tgt_text,
+                               max_length=self.max_tgt,
+                               truncation=True,
+                               padding="max_length")
+
+                # label -100 masking
+                labels = [(t if t != self.tok.pad_token_id else -100) for t in dec.input_ids]
+
+                self.examples.append({
+                    "input_ids": enc.input_ids,
+                    "attention_mask": enc.attention_mask,
+                    "labels": labels,
+                    "strategy_id": sid,
+                })
         torch.save(self.examples, cache_f)
 
     # -------------- torch Dataset interface --------------
@@ -161,28 +179,8 @@ class ESConvGenDataset(torch.utils.data.Dataset):
         return len(self.examples)
 
     def __getitem__(self, idx):
-        ex = self.examples[idx]
-        enc = self.tok(
-            ex["context"],
-            max_length=self.max_src,
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt",
-        )
-        dec = self.tok(
-            text_target=ex["target"],
-            max_length=self.max_tgt,
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt",
-        )
-        item = {
-            "input_ids": enc["input_ids"].squeeze(),
-            "attention_mask": enc["attention_mask"].squeeze(),
-            "labels": dec["input_ids"].squeeze(),
-            "strategy_id": ex["strategy_id"],  # 평가용
-        }
-        return item
+        # 이미 토큰화된 예제를 그대로 반환
+        return self.examples[idx]
 
 
 # ===================== 유틸 함수 =====================
@@ -233,30 +231,15 @@ def main():
     )
     set_seed(args.seed)
 
-    # -------- tokenizer & model --------
+    # 토크나이저 및 모델 초기화
     tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
-
-    # 1️⃣ 추가할 special 토큰 목록 구성 ---------------------------------
-    extra_specials = list(SPECIAL_TOKENS.values())          # [USR] [SYS] [STRATEGY]
-    if args.strategy_mode == "token":
-        extra_specials += STRAT_TOKENS                      # [STRAT_Question] ...
-    # 중복 제거(순서 유지)
-    extra_specials = list(dict.fromkeys(extra_specials))
-
-    # 2️⃣ 단 한 번의 add_special_tokens 호출 ----------------------------
-    n_added = tokenizer.add_special_tokens(
-        {"additional_special_tokens": extra_specials}
-    )
-    logger.info(f"added {n_added} extra special tokens")
-
-    logger.info(
-        f"✅ total special tokens = {len(tokenizer.all_special_ids)} "
-        f"(role {len(SPECIAL_TOKENS)}, strategy "
-        f"{len(STRAT_TOKENS) if args.strategy_mode == 'token' else 0})"
-    )
-
-    # 3️⃣ 모델 임베딩 사이즈 조정 ----------------------------------------
+    
+    # *** 특수 토큰 추가 ***
+    added = add_esconv_special_tokens(tokenizer)
+    logger.info(f"{added} special tokens added (raw+space variants)")
+    
     model = BartForConditionalGeneration.from_pretrained("facebook/bart-base")
+    # 임베딩 크기 확장 (특수 토큰 수용)
     model.resize_token_embeddings(len(tokenizer))
 
     # -------- dataset --------
@@ -534,20 +517,47 @@ def main():
         import textwrap
         for i in random.sample(range(len(train_ds)), args.show_samples):
             ex = train_ds[i]
-            ctx_plain = safe_batch_decode([ex["input_ids"]], tokenizer, skip_special_tokens=True)[0]
-            tgt_plain = safe_batch_decode([[t if t != -100 else tokenizer.pad_token_id for t in ex["labels"]]], 
-                                          tokenizer, skip_special_tokens=True)[0]
+            ctx_plain = safe_decode(ex["input_ids"], tokenizer, skip_special_tokens=False)
+            tgt_plain = safe_decode([t if t != -100 else tokenizer.pad_token_id for t in ex["labels"]], 
+                                          tokenizer, skip_special_tokens=False)
+            
+            # 전략 토큰이 <unk>로 변환되었는지 확인하기 위한 디버깅 출력
+            first_tokens = tokenizer.convert_ids_to_tokens(ex["labels"][:10])
+            
             logging.info(
                 "\n===== SAMPLE {:d} =====\n"
-                "CONTEXT:\n{}\n\nTARGET:\n{}\nstrategy_id: {}\n{}".format(
+                "CONTEXT:\n{}\n\nTARGET:\n{}\n"
+                "First tokens: {}\n"
+                "strategy_id: {}\n{}".format(
                     i,
                     textwrap.fill(ctx_plain, 120),
                     tgt_plain,
+                    first_tokens,
                     ex["strategy_id"],
                     "=" * 60
                 )
             )
         return
+
+
+def add_esconv_special_tokens(tokenizer):
+    """
+    ESConv 특수 토큰을 토크나이저에 추가하고, 모든 토큰이 단일 토큰으로 처리되게 함
+    """
+    # 1. 모든 특수 토큰 목록 생성 
+    special_tokens = list(SPECIAL_TOKENS.values()) + STRAT_TOKENS
+    
+    # 2. 특수 토큰 추가 (tokenizer.add_special_tokens가 가장 신뢰할 수 있는 방법)
+    special_tokens_dict = {"additional_special_tokens": special_tokens}
+    num_added = tokenizer.add_special_tokens(special_tokens_dict)
+    
+    # 3. 토큰이 제대로 추가됐는지 검증
+    for token in STRAT_TOKENS[:2]:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        is_special = token_id in tokenizer.all_special_ids
+        logger.info(f"Token: {token} -> ID: {token_id} (special={is_special})")
+    
+    return num_added
 
 
 if __name__ == "__main__":
