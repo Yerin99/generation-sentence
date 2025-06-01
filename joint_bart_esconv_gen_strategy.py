@@ -9,12 +9,12 @@ joint_bart_esconv_gen_strategy.py
 # 자연어 전략 프리픽스
 CUDA_VISIBLE_DEVICES=2 python joint_bart_esconv_gen_strategy.py \
     --eval_init \
-    --strategy_mode natural --ctx_strategy_rep natural --epochs 10 --output_dir outputs/natural
+    --strategy_mode natural --ctx_strategy_rep natural --epochs 10 --output_dir outputs/natural_edit
 
 # 특수 토큰 전략 프리픽스
 CUDA_VISIBLE_DEVICES=3 python joint_bart_esconv_gen_strategy.py \
     --eval_init \
-    --strategy_mode token --ctx_strategy_rep token --epochs 10 --output_dir outputs/token
+    --strategy_mode token --ctx_strategy_rep token --epochs 10 --output_dir outputs/token_edit
 
 # 자연어 전략 + tiny 1% + patience 3
 CUDA_VISIBLE_DEVICES=2 python joint_bart_esconv_gen_strategy.py \
@@ -73,9 +73,9 @@ def build_prefix(strategy_id: int, mode: str) -> str:
     """
     sys_token = SPECIAL_TOKENS["sys"]
     if mode == "natural":
-        return f"{ID2STR[strategy_id]}: {sys_token} "
+        return f"{sys_token} {ID2STR[strategy_id]}: "
     else:
-        return f"{STRAT_TOKENS[strategy_id]} {sys_token} "
+        return f"{sys_token} {STRAT_TOKENS[strategy_id]}"
 
 
 # ===================== 데이터셋 =====================
@@ -271,6 +271,7 @@ def main():
         eval_steps=args.eval_steps,
         save_strategy="steps",
         save_steps=args.eval_steps,
+        save_total_limit=1,
         logging_strategy="steps",
         logging_steps=args.eval_steps,
         predict_with_generate=True,
