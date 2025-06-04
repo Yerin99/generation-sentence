@@ -6,7 +6,7 @@ train_sasrec_strategy
 """
 
 from __future__ import annotations
-import argparse, random, json
+import argparse, random, json, logging
 from pathlib import Path
 
 import torch
@@ -20,6 +20,9 @@ from utils.strategy import STRATEGIES                                   # 8개 �
 from src.data.esconv_strategy_dataset import (
     ESConvStrategySequenceDataset, PAD_ID, N_ITEMS)
 from src.models.sasrec_strategy import SASRecForStrategy
+
+# 로거 설정
+logger = logging.getLogger(__name__)
 
 # reproducibility ------------------------------------------------------
 def set_seed(seed: int):
@@ -59,15 +62,45 @@ def main():
     parser.add_argument("--tiny_frac", type=float, default=None)
     parser.add_argument("--patience", type=int, default=5,
                     help="early-stopping patience (#epochs without val improvement)")
+    parser.add_argument("--n_heads", type=int, default=2)
+    parser.add_argument("--n_layers", type=int, default=2)
+    parser.add_argument("--weight_exp", type=float, default=0.5,
+                    help="클래스 가중치 계산 지수 (낮을수록 희소 클래스 강조)")
+    parser.add_argument("--dataset", choices=["esconv", "multiesc"],
+                        default="esconv",
+                        help="사용할 데이터셋 종류")
     args = parser.parse_args()
+
+    # 로깅 설정
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ───────── dataset & dataloader ─────────
-    train_ds = ESConvStrategySequenceDataset("train", args.max_seq_len, tiny_frac=args.tiny_frac)
-    val_ds   = ESConvStrategySequenceDataset("validation", args.max_seq_len, tiny_frac=args.tiny_frac)
-    test_ds  = ESConvStrategySequenceDataset("test", args.max_seq_len, tiny_frac=args.tiny_frac)
+    if args.dataset == "esconv":
+        from src.data.esconv_strategy_dataset import ESConvStrategySequenceDataset as DS
+    else:
+        from src.data.multiesc_strategy_dataset import MultiESCStrategySequenceDataset as DS
+
+    # 데이터셋별 상수 바인딩
+    try:
+        # 데이터셋 클래스에서 상수를 가져오려고 시도
+        STRATEGIES = DS.STRATEGIES            # type: ignore
+        PAD_ID     = DS.PAD_ID                # type: ignore
+        N_ITEMS    = DS.N_ITEMS               # type: ignore
+    except AttributeError:
+        # 속성이 없으면 utils.strategy에서 가져옴
+        from utils.strategy import STRATEGIES
+        from src.data.esconv_strategy_dataset import PAD_ID, N_ITEMS
+        logger.warning(f"DS.STRATEGIES not found, using default STRATEGIES from utils.strategy")
+
+    train_ds = DS("train", args.max_seq_len, tiny_frac=args.tiny_frac)
+    val_ds   = DS("validation", args.max_seq_len, tiny_frac=args.tiny_frac)
+    test_ds  = DS("test", args.max_seq_len, tiny_frac=args.tiny_frac)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=4)
@@ -79,26 +112,27 @@ def main():
         hidden_size=args.hidden_size,
         max_seq_len=args.max_seq_len,
         pad_id=PAD_ID,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # (기존 optimizer 정의 아래)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=1, verbose=True
+        optimizer, mode="max", factor=0.5, patience=1
     )
 
     # ---------- class weight 계산 ----------
     from collections import Counter
-    def compute_class_weight(dataset):
+    def compute_class_weight(dataset, exp=0.5):
         counter = Counter([t for _, t in dataset.samples])
         total = sum(counter.values())
-        # inverse frequency (sqrt 완화)
-        weight = torch.tensor([1.0/((counter[i]/total)**0.5 + 1e-9) for i in range(N_ITEMS)])
-        weight = weight / weight.mean()  # 평균 1 로 스케일
+        weight = torch.tensor([1.0/((counter[i]/total)**exp + 1e-9) for i in range(N_ITEMS)])
+        weight = weight / weight.mean()
         return weight.to(device)
 
-    class_weight = compute_class_weight(train_ds)
+    class_weight = compute_class_weight(train_ds, args.weight_exp)
     criterion = torch.nn.CrossEntropyLoss(weight=class_weight)
 
     # ───────── training loop ─────────
@@ -159,6 +193,13 @@ def main():
             if epochs_no_improve >= args.patience:
                 print(f"no improvement for {args.patience} epochs → early stop")
                 break
+
+        # val_acc 기반으로 스케줄러 호출 후
+        sched.step(val_acc)
+
+        # 현재 학습률 출력 (ReduceLROnPlateau는 get_last_lr()가 없음)
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Current learning rate: {current_lr}")
 
     # ───────── test ─────────
     best_path = Path(args.output_dir) / "best_model.pt"

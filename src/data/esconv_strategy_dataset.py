@@ -20,6 +20,9 @@ import warnings
 
 from utils.strategy import STRATEGIES, STR2ID, to_refined  # 재활용
 
+# ★ 추가: 전략 문자열 ↔ 정수 ID 매핑
+STRATEGY2ID = {s: i for i, s in enumerate(STRATEGIES)}
+
 PAD_ID: int = len(STRATEGIES)          # 8 → padding 전용 id
 N_ITEMS: int = PAD_ID + 1              # 9 (0~7 전략 + 8 pad)
 
@@ -32,6 +35,11 @@ class ESConvStrategySequenceDataset(torch.utils.data.Dataset):
     max_seq_len     : Transformer 입력 길이
     cache_dir       : 전처리한 pt 파일 저장 경로
     """
+
+    # 클래스 속성 추가 - train_sasrec_strategy.py에서 접근 가능하게 함
+    STRATEGIES = STRATEGIES
+    PAD_ID = PAD_ID
+    N_ITEMS = N_ITEMS
 
     def __init__(self,
                  split: str,

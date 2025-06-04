@@ -80,6 +80,10 @@ class SASRecForStrategy(nn.Module):
 
         # 마지막 실 아이템 위치(hidden) 추출
         seq_lengths = (seq != self.pad_id).sum(dim=1)          # (B,)
+        
+        # 안전성 검사: 모든 시퀀스가 적어도 하나의 실제 아이템을 가지도록 함
+        seq_lengths = torch.max(seq_lengths, torch.ones_like(seq_lengths))  # 최소 1 보장
+        
         last_idx = (seq_lengths - 1).clamp(min=0).unsqueeze(1).unsqueeze(2)
         last_idx = last_idx.expand(-1, 1, self.hidden_size)    # (B,1,H)
         last_hidden = h.gather(1, last_idx).squeeze(1)         # (B,H)
