@@ -3,6 +3,7 @@
 /cache_joint
 /cache_gen
 /cache_sasrec
+/cache_dialog_gen
 
 */__pycache__
 */*/__pycache__
