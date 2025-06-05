@@ -1,0 +1,106 @@
+{
+  "esconv": {
+    "train": {
+      "total_oov": 0,
+      "total_tokens": 508069,
+      "samples_with_oov": 0,
+      "total_samples": 910,
+      "utterance_stats": {
+        "usr": {
+          "total_oov": 0,
+          "total_tokens": 239612,
+          "oov_ratio": 0.0
+        },
+        "sys": {
+          "total_oov": 0,
+          "total_tokens": 268457,
+          "oov_ratio": 0.0
+        }
+      },
+      "overall_oov_ratio": 0.0,
+      "samples_with_oov_ratio": 0.0
+    },
+    "validation": {
+      "total_oov": 0,
+      "total_tokens": 108980,
+      "samples_with_oov": 0,
+      "total_samples": 195,
+      "utterance_stats": {
+        "usr": {
+          "total_oov": 0,
+          "total_tokens": 51686,
+          "oov_ratio": 0.0
+        },
+        "sys": {
+          "total_oov": 0,
+          "total_tokens": 57294,
+          "oov_ratio": 0.0
+        }
+      },
+      "overall_oov_ratio": 0.0,
+      "samples_with_oov_ratio": 0.0
+    },
+    "test": {
+      "total_oov": 0,
+      "total_tokens": 108718,
+      "samples_with_oov": 0,
+      "total_samples": 195,
+      "utterance_stats": {
+        "usr": {
+          "total_oov": 0,
+          "total_tokens": 51970,
+          "oov_ratio": 0.0
+        },
+        "sys": {
+          "total_oov": 0,
+          "total_tokens": 56748,
+          "oov_ratio": 0.0
+        }
+      },
+      "overall_oov_ratio": 0.0,
+      "samples_with_oov_ratio": 0.0
+    }
+  },
+  "multiesc": {
+    "train": {
+      "total_oov": 0,
+      "total_tokens": 528757,
+      "samples_with_oov": 0,
+      "total_samples": 910,
+      "utterance_stats": {
+        "usr": {
+          "total_oov": 0,
+          "total_tokens": 253389,
+          "oov_ratio": 0.0
+        },
+        "sys": {
+          "total_oov": 0,
+          "total_tokens": 275368,
+          "oov_ratio": 0.0
+        }
+      },
+      "overall_oov_ratio": 0.0,
+      "samples_with_oov_ratio": 0.0
+    },
+    "test": {
+      "total_oov": 0,
+      "total_tokens": 113449,
+      "samples_with_oov": 0,
+      "total_samples": 195,
+      "utterance_stats": {
+        "usr": {
+          "total_oov": 0,
+          "total_tokens": 54917,
+          "oov_ratio": 0.0
+        },
+        "sys": {
+          "total_oov": 0,
+          "total_tokens": 58532,
+          "oov_ratio": 0.0
+        }
+      },
+      "overall_oov_ratio": 0.0,
+      "samples_with_oov_ratio": 0.0
+    }
+  }
+}
