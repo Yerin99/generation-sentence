@@ -44,6 +44,7 @@ from transformers import (
     Seq2SeqTrainingArguments,
     DataCollatorForSeq2Seq,
     EarlyStoppingCallback,
+    TrainerCallback,
     set_seed,
 )
 from utils.metrics import generation_metrics, add_strategy_metrics
@@ -222,6 +223,9 @@ def main():
                         help="학습 전 초기 모델(epoch 0)에서 평가 수행")
     parser.add_argument("--eval_only", action="store_true",
                         help="학습 없이 평가만 수행")
+    parser.add_argument("--metric_for_best_model", type=str, default="ppl",
+                        choices=["eval_loss", "ppl", "strategy_accuracy", "bleu1"],
+                        help="Best model 선정 기준 메트릭")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -262,6 +266,16 @@ def main():
     data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding="longest")
 
     # -------- training args --------
+    # metric_for_best_model 매핑 (ppl -> eval_ppl)
+    best_metric_key = args.metric_for_best_model
+    if args.metric_for_best_model == "ppl":
+        best_metric_key = "eval_ppl"
+    
+    # greater_is_better 설정
+    greater_is_better = True
+    if best_metric_key in ["eval_ppl", "eval_loss"]:
+        greater_is_better = False
+
     t_args = Seq2SeqTrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -278,71 +292,22 @@ def main():
         generation_max_length=128,
         generation_num_beams=5,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        metric_for_best_model=best_metric_key,
+        greater_is_better=greater_is_better,
         report_to="none",
         seed=args.seed,
     )
 
-    # -------- metric fn --------
-    def calculate_perplexity(loss):
-        """
-        Cross-entropy loss에서 perplexity 계산
-        PPL = exp(loss)
-        """
-        return np.exp(loss)
+    # -------- Callback for PPL --------
+    class PerplexityCallback(TrainerCallback):
+        """Eval 루프 이후 metrics dict에 eval_ppl 키를 추가한다."""
+        def on_evaluate(self, args, state, control, **kwargs):
+            metrics = kwargs.get("metrics", {})
+            if metrics is not None and "eval_loss" in metrics:
+                metrics["eval_ppl"] = float(np.exp(metrics["eval_loss"]))
+            return control
 
-    def build_compute_metrics(eval_dataset):
-        def compute_metrics(eval_pred):
-            preds, labels = eval_pred
-            labels[labels == -100] = tokenizer.pad_token_id
-
-            # 기본 메트릭 초기화
-            metrics = {}
-            
-            # PPL 계산 추가
-            if hasattr(eval_pred, 'metrics') and 'eval_loss' in eval_pred.metrics:
-                metrics['perplexity'] = calculate_perplexity(eval_pred.metrics['eval_loss'])
-            
-            # 1) 텍스트 메트릭
-            gen_txt = [strip_strategy_prefix(t, args.strategy_mode)
-                       for t in safe_batch_decode(preds, tokenizer, skip_special_tokens=True)]
-            ref_txt = [strip_strategy_prefix(t, args.strategy_mode)
-                       for t in safe_batch_decode(labels, tokenizer, skip_special_tokens=True)]
-            gen_m = generation_metrics(gen_txt, ref_txt)
-            metrics.update(gen_m)  # 이렇게 변경
-
-            # 2) 전략 id 파싱 (실패 → Others 로 치환)
-            sid_pred, sid_gt = [], []
-            for p_ids, ex in zip(preds, eval_dataset.examples):
-                sid = parse_strategy_from_ids(p_ids, tokenizer, args.strategy_mode)
-                if sid is None:
-                    sid = STR2ID["Others"]
-                sid_pred.append(sid)
-                sid_gt.append(ex["strategy_id"])
-            gen_m = add_strategy_metrics(metrics, sid_pred, sid_gt)  # 여기서 metrics로 변경
-
-            # 3) classification_report 로그 (labels 명시, zero_division 방지)
-            from sklearn.metrics import classification_report
-            report = classification_report(
-                sid_gt,
-                sid_pred,
-                labels=list(range(len(STRATEGIES))),   # ← 전체 클래스 인덱스
-                target_names=STRATEGIES,
-                digits=2,
-                zero_division=0
-            )
-            logging.info("\n" + report)
-            
-            # PPL을 포함한 주요 메트릭 로깅
-            if 'perplexity' in metrics:
-                logging.info(f"📊 Eval Metrics: PPL={metrics['perplexity']:.4f}, BLEU-1={metrics['bleu1']:.4f}, "
-                            f"Strategy Accuracy={metrics['strategy_accuracy']:.4f}")
-            
-            return metrics
-        return compute_metrics
-
-    # -------- trainer --------
+    # -------- training args --------
     trainer = Seq2SeqTrainer(
         model=model,
         args=t_args,
@@ -350,8 +315,8 @@ def main():
         eval_dataset=val_ds,
         data_collator=data_collator,
         tokenizer=tokenizer,
-        compute_metrics=build_compute_metrics(val_ds),
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.patience)],
+        compute_metrics=build_compute_metrics(val_ds, tokenizer, args),
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.patience), PerplexityCallback()],
     )
 
     # --------------------- 초기 모델(epoch 0) 평가 ---------------------
@@ -383,8 +348,7 @@ def main():
         test_out = trainer.predict(test_ds, metric_key_prefix="init_test", **gen_kwargs)
         
         # PPL 계산
-        test_loss = test_out.metrics.get('init_test_loss', 0)
-        test_ppl = calculate_perplexity(test_loss)
+        test_ppl = float(np.exp(test_out.metrics.get('init_test_loss', 0)))
         logger.info(f"Initial Test Perplexity: {test_ppl:.4f}")
         
         # 텍스트 생성 메트릭 계산
@@ -459,9 +423,8 @@ def main():
         trainer.compute_metrics = None
         test_out = trainer.predict(test_ds, metric_key_prefix="test", **gen_kwargs)
 
-        # PPL 계산 추가
-        test_loss = test_out.metrics.get('test_loss', 0)
-        test_ppl = calculate_perplexity(test_loss)
+        # PPL 계산
+        test_ppl = float(np.exp(test_out.metrics.get('test_loss', 0)))
         logger.info(f"Test Perplexity: {test_ppl:.4f}")
 
         # 2) generation / strategy 메트릭 직접 계산
@@ -559,6 +522,48 @@ def add_esconv_special_tokens(tokenizer):
         logger.info(f"Token: {token} -> ID: {token_id} (special={is_special})")
     
     return num_added
+
+
+def build_compute_metrics(eval_dataset, tokenizer, args):
+    def compute_metrics(eval_pred):
+        preds, labels = eval_pred
+        labels[labels == -100] = tokenizer.pad_token_id
+
+        metrics = {}
+
+        # 1) 텍스트 메트릭
+        gen_txt = [strip_strategy_prefix(t, args.strategy_mode)
+                   for t in safe_batch_decode(preds, tokenizer, skip_special_tokens=True)]
+        ref_txt = [strip_strategy_prefix(t, args.strategy_mode)
+                   for t in safe_batch_decode(labels, tokenizer, skip_special_tokens=True)]
+        gen_m = generation_metrics(gen_txt, ref_txt)
+        metrics.update(gen_m)
+        for k, v in list(gen_m.items()):
+            metrics[f'eval_{k}'] = v
+
+        # 2) 전략 메트릭
+        sid_pred, sid_gt = [], []
+        for p_ids, ex in zip(preds, eval_dataset.examples):
+            sid = parse_strategy_from_ids(p_ids, tokenizer, args.strategy_mode)
+            if sid is None:
+                sid = STR2ID["Others"]
+            sid_pred.append(sid)
+            sid_gt.append(ex["strategy_id"])
+        strat_metrics = add_strategy_metrics({}, sid_pred, sid_gt)
+        metrics.update(strat_metrics)
+        for k, v in list(strat_metrics.items()):
+            metrics[f'eval_{k}'] = v
+
+        # 로그
+        from sklearn.metrics import classification_report
+        report = classification_report(sid_gt, sid_pred, labels=list(range(len(STRATEGIES))), target_names=STRATEGIES, digits=2, zero_division=0)
+        logging.info("\n" + report)
+
+        logging.info(
+            f"📊 Eval Metrics: BLEU-1={metrics['eval_bleu1']:.4f}, Strategy Acc={metrics['eval_strategy_accuracy']:.4f}")
+
+        return metrics
+    return compute_metrics
 
 
 if __name__ == "__main__":
