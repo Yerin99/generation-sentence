@@ -33,7 +33,8 @@ class SASRecForStrategy(nn.Module):
                  n_heads: int = 2,
                  n_layers: int = 2,
                  dropout_rate: float = 0.2,
-                 pad_id: int = 8):
+                 pad_id: int = 8,
+                 no_hist_id: int | None = None):
         super().__init__()
         self.item_emb = nn.Embedding(n_items, hidden_size, padding_idx=pad_id)
         self.pos_emb = nn.Embedding(max_seq_len, hidden_size)
@@ -58,6 +59,9 @@ class SASRecForStrategy(nn.Module):
         nn.init.normal_(self.item_emb.weight, std=0.02)
         nn.init.normal_(self.pos_emb.weight, std=0.02)
         nn.init.xavier_uniform_(self.output_layer.weight)
+        
+        # no_history_id 저장
+        self.no_hist_id = no_hist_id
 
     # ────────────────────────────────────────────
     # Forward

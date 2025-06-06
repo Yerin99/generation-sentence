@@ -23,8 +23,15 @@ from utils.strategy import STRATEGIES, STR2ID, to_refined  # 재활용
 # ★ 추가: 전략 문자열 ↔ 정수 ID 매핑
 STRATEGY2ID = {s: i for i, s in enumerate(STRATEGIES)}
 
-PAD_ID: int = len(STRATEGIES)          # 8 → padding 전용 id
-N_ITEMS: int = PAD_ID + 1              # 9 (0~7 전략 + 8 pad)
+# ────────────────────────────────────────────────
+# Special IDs
+# ────────────────────────────────────────────────
+# 기존: 0~7 = 전략 id, 8 = PAD
+# 추가: 9 = NO_HISTORY (빈 시퀀스용)
+
+PAD_ID: int = len(STRATEGIES)          # 8  (padding 전용)
+NO_HISTORY_ID: int = PAD_ID + 1        # 9  (cold-start용)
+N_ITEMS: int = NO_HISTORY_ID + 1       # 10 (0~7 전략 + 8 pad + 9 no_history)
 
 
 class ESConvStrategySequenceDataset(torch.utils.data.Dataset):
@@ -39,6 +46,7 @@ class ESConvStrategySequenceDataset(torch.utils.data.Dataset):
     # 클래스 속성 추가 - train_sasrec_strategy.py에서 접근 가능하게 함
     STRATEGIES = STRATEGIES
     PAD_ID = PAD_ID
+    NO_HISTORY_ID = NO_HISTORY_ID
     N_ITEMS = N_ITEMS
 
     def __init__(self,
@@ -74,10 +82,16 @@ class ESConvStrategySequenceDataset(torch.utils.data.Dataset):
                 cur_ref = to_refined(t.get("strategy", "Others"))
                 strat_seq.append(STR2ID.get(cur_ref, STR2ID["Others"]))
 
-            # 길이가 2 이상인 경우만 샘플 생성
-            for idx in range(1, len(strat_seq)):
-                hist = strat_seq[:idx][-max_seq_len:]                 # 앞에서 자르기
-                hist_pad = [PAD_ID] * (max_seq_len - len(hist)) + hist  # left-pad
+            # 첫 turn(빈 history) 포함 모든 위치에서 샘플 생성
+            for idx in range(len(strat_seq)):
+                hist = strat_seq[:idx][-max_seq_len:]
+
+                # 빈 시퀀스 → NO_HISTORY_ID 한 개만 넣기
+                if len(hist) == 0:
+                    hist = [NO_HISTORY_ID]
+
+                # left-padding
+                hist_pad = [PAD_ID] * (max_seq_len - len(hist)) + hist
                 target = strat_seq[idx]
                 self.samples.append((hist_pad, target))
 

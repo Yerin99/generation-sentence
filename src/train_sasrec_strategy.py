@@ -18,7 +18,7 @@ from sklearn.metrics import (
 
 from utils.strategy import STRATEGIES                                   # 8개 전략
 from src.data.esconv_strategy_dataset import (
-    ESConvStrategySequenceDataset, PAD_ID, N_ITEMS)
+    ESConvStrategySequenceDataset, PAD_ID, N_ITEMS, NO_HISTORY_ID)
 from src.models.sasrec_strategy import SASRecForStrategy
 
 # 로거 설정
@@ -92,10 +92,11 @@ def main():
         STRATEGIES = DS.STRATEGIES            # type: ignore
         PAD_ID     = DS.PAD_ID                # type: ignore
         N_ITEMS    = DS.N_ITEMS               # type: ignore
+        NO_HISTORY_ID = DS.NO_HISTORY_ID      # type: ignore
     except AttributeError:
         # 속성이 없으면 utils.strategy에서 가져옴
         from utils.strategy import STRATEGIES
-        from src.data.esconv_strategy_dataset import PAD_ID, N_ITEMS
+        from src.data.esconv_strategy_dataset import PAD_ID, N_ITEMS, NO_HISTORY_ID
         logger.warning(f"DS.STRATEGIES not found, using default STRATEGIES from utils.strategy")
 
     train_ds = DS("train", args.max_seq_len, tiny_frac=args.tiny_frac)
@@ -112,6 +113,7 @@ def main():
         hidden_size=args.hidden_size,
         max_seq_len=args.max_seq_len,
         pad_id=PAD_ID,
+        no_hist_id=NO_HISTORY_ID,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
     ).to(device)
@@ -128,7 +130,10 @@ def main():
     def compute_class_weight(dataset, exp=0.5):
         counter = Counter([t for _, t in dataset.samples])
         total = sum(counter.values())
-        weight = torch.tensor([1.0/((counter[i]/total)**exp + 1e-9) for i in range(N_ITEMS)])
+        weight = torch.tensor([
+            0.0 if i in {PAD_ID, NO_HISTORY_ID} else 1.0/((counter[i]/total)**exp + 1e-9)
+            for i in range(N_ITEMS)
+        ])
         weight = weight / weight.mean()
         return weight.to(device)
 

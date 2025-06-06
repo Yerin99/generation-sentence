@@ -32,9 +32,10 @@ STRATEGIES = [
 STR2ID = {s: i for i, s in enumerate(STRATEGIES)}
 ID2STR = {i: s for s, i in enumerate(STRATEGIES)}
 
-# padding / item 수
-PAD_ID: int = len(STRATEGIES)           # 8
-N_ITEMS: int = PAD_ID + 1               # 9
+# Special IDs
+PAD_ID: int = len(STRATEGIES)           # 8 (padding)
+NO_HISTORY_ID: int = PAD_ID + 1         # 9 (no history)
+N_ITEMS: int = NO_HISTORY_ID + 1        # 10
 
 # ────────────────────────────────────────────────
 # MultiESC 원본 문자열 → 위 정의한 canonical 이름 매핑
@@ -66,6 +67,7 @@ class MultiESCStrategySequenceDataset(Dataset):
     # ──────────────  training 스크립트에서 접근할 상수 ──────────────
     STRATEGIES = STRATEGIES
     PAD_ID     = PAD_ID
+    NO_HISTORY_ID = NO_HISTORY_ID
     N_ITEMS    = N_ITEMS
 
     def __init__(self,
@@ -126,8 +128,13 @@ class MultiESCStrategySequenceDataset(Dataset):
             sys_strats.append(strat_id)
 
         # 전략 시퀀스 → (과거 seq, 현 전략) 쌍으로 분할
-        for idx in range(1, len(sys_strats)):
+        for idx in range(len(sys_strats)):
             seq = sys_strats[:idx]
+
+            # 빈 history → NO_HISTORY_ID 추가
+            if len(seq) == 0:
+                seq = [NO_HISTORY_ID]
+
             # padding / truncation (왼쪽 pad)
             seq = seq[-self.max_seq_len:]
             pad_len = self.max_seq_len - len(seq)
