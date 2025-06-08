@@ -14,6 +14,9 @@ CUDA_VISIBLE_DEVICES=0 python bart_dialog_generator.py --tiny_frac 0.01 --epochs
 
 # facebook/bart-base 원본 모델 평가
 CUDA_VISIBLE_DEVICES=3 python bart_dialog_generator.py --eval_only --output_dir outputs/dialog_eval
+
+# 그래디언트 누적을 사용한 대용량 배치 학습 (실효 배치 크기 32)
+CUDA_VISIBLE_DEVICES=2 python bart_dialog_generator.py --batch_size 16 --gradient_accumulation_steps 2 --output_dir outputs/dialog_large_batch
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from typing import Dict, List
 
 import numpy as np
 import torch
+import nltk  # NLTK 추가
 from datasets import load_dataset
 from transformers import (
     BartTokenizer,
@@ -179,10 +183,18 @@ def safe_decode(ids, tokenizer, skip_special_tokens=False, **kwargs):
 
 # ===================== 메인 =====================
 def main():
+    # NLTK 데이터 다운로드 (필요시)
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt')
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, default="outputs/dialog_gen")
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="그래디언트 누적 스텝 수 (실제 배치 크기 = batch_size * gradient_accumulation_steps)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tiny_frac", type=float, default=None, help="0~1: 디버그용 샘플 비율")
     parser.add_argument("--patience", type=int, default=5,
@@ -259,6 +271,7 @@ def main():
         repetition_penalty=1.2,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
     )
     model.generation_config = generation_config
 
@@ -280,20 +293,12 @@ def main():
     data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding="longest")
 
     # -------- training args --------
-    # PerplexityCallback 정의
-    class PerplexityCallback(TrainerCallback):
-        """Eval 루프 이후 metrics dict에 eval_ppl 키를 추가한다."""
-        def on_evaluate(self, args, state, control, **kwargs):
-            metrics = kwargs.get("metrics", {})
-            if metrics is not None and "eval_loss" in metrics:
-                metrics["eval_ppl"] = float(np.exp(metrics["eval_loss"]))
-            return control
-
     t_args = Seq2SeqTrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         weight_decay=0.01,
         warmup_ratio=args.warmup_ratio,
@@ -306,41 +311,125 @@ def main():
         logging_steps=args.eval_steps,
         predict_with_generate=True,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_ppl",
-        greater_is_better=False,  # PPL은 낮을수록 좋음
+        metric_for_best_model="eval_loss",  # eval_ppl 대신 eval_loss 직접 사용
+        greater_is_better=False,  # loss는 낮을수록 좋음
         report_to="none",
         seed=args.seed,
+        # 메모리 체크 비활성화로 안정성 향상
+        dataloader_drop_last=False,
+        skip_memory_metrics=True,
     )
+    
+    # 실제 배치 크기 로그 출력
+    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
+    logger.info(f"배치 크기: {args.batch_size}, 그래디언트 누적 단계: {args.gradient_accumulation_steps}")
+    logger.info(f"실효 배치 크기: {effective_batch_size} (batch_size * gradient_accumulation_steps)")
 
     # 메트릭 계산 함수
     def compute_metrics(eval_pred):
         preds, labels = eval_pred
         labels[labels == -100] = tokenizer.pad_token_id
 
+        # 메트릭 딕셔너리 초기화
+        metrics = {}
+        
+        if hasattr(eval_pred, "loss") and eval_pred.loss is not None:
+            metrics["eval_loss"] = eval_pred.loss
+            metrics["eval_ppl"] = float(np.exp(eval_pred.loss))
+
         # 텍스트로 디코딩
-        gen_txt = tokenizer.batch_decode(preds, skip_special_tokens=True)
-        ref_txt = tokenizer.batch_decode(labels, skip_special_tokens=True)
+        gen_raw = tokenizer.batch_decode(preds, skip_special_tokens=True)
+        ref_raw = tokenizer.batch_decode(labels, skip_special_tokens=True)
+        
+        # MultiESC 스타일 전처리: 소문자화 및 nltk 토큰화
+        gen_txt = []
+        ref_txt = []
+        for gen, ref in zip(gen_raw, ref_raw):
+            # 소문자화 후 nltk 토큰화하여 공백으로 재결합
+            gen_processed = ' '.join(nltk.word_tokenize(gen.lower()))
+            ref_processed = ' '.join(nltk.word_tokenize(ref.lower()))
+            gen_txt.append(gen_processed)
+            ref_txt.append(ref_processed)
 
         # 생성 메트릭 계산 (BLEU, ROUGE 등)
-        metrics = generation_metrics(gen_txt, ref_txt)
+        text_metrics = generation_metrics(gen_txt, ref_txt)
         
         # 평가 메트릭에 "eval_" 접두사 추가
-        for k, v in list(metrics.items()):
+        for k, v in text_metrics.items():
             metrics[f'eval_{k}'] = v
 
         logger.info(
-            f"📊 Eval Metrics: BLEU-1={metrics['eval_bleu1']:.4f}, ROUGE-L={metrics['eval_rouge_l']:.4f}")
+            f"📊 Eval Metrics: BLEU-1={metrics.get('eval_bleu1', 0):.4f}, "
+            f"ROUGE-L={metrics.get('eval_rouge_l', 0):.4f}, "
+            f"PPL={metrics.get('eval_ppl', 0):.4f}"
+            )
 
         return metrics
 
+    # 체크포인트 로딩 관련 오류를 해결하기 위한 콜백
+    class TokenEmbeddingCallback(TrainerCallback):
+        """체크포인트 로드 시 토큰 임베딩 크기를 올바르게 유지"""
+        def __init__(self, tokenizer, special_token_ids):
+            self.tokenizer = tokenizer
+            self.special_token_ids = special_token_ids
+        
+        def on_train_begin(self, args, state, control, model=None, **kwargs):
+            """훈련 시작 시 모델 임베딩 크기 확인"""
+            if model is not None:
+                model.resize_token_embeddings(len(self.tokenizer))
+                logger.info(f"모델 임베딩 크기 조정: {len(self.tokenizer)}")
+        
+        def on_step_end(self, args, state, control, model=None, **kwargs):
+            """각 스텝 후 임베딩 크기 확인"""
+            if state.global_step % 1000 == 0 and model is not None:
+                if model.get_input_embeddings().weight.shape[0] != len(self.tokenizer):
+                    logger.warning(f"임베딩 크기 불일치 감지: {model.get_input_embeddings().weight.shape[0]} vs {len(self.tokenizer)}")
+                    model.resize_token_embeddings(len(self.tokenizer))
+        
+        def on_load_checkpoint(self, args, state, control, **kwargs):
+            """체크포인트 로드 시 호출"""
+            logger.info("체크포인트 로드 중...")
+            
+        def on_checkpoint_model_loading(self, args, state, control, model=None, **kwargs):
+            """체크포인트에서 모델 로드 시 호출"""
+            if model is not None:
+                # 임베딩 크기 조정
+                model.resize_token_embeddings(len(self.tokenizer))
+                logger.info(f"체크포인트 로드 후 모델 임베딩 크기 조정: {len(self.tokenizer)}")
+                
+                # 생성 설정 다시 적용
+                model.generation_config = generation_config
+                
+                # 미리 구성된 모델로 초기 가중치 복사 (선택 사항)
+                if hasattr(model, 'lm_head') and not hasattr(model.lm_head, 'weight'):
+                    logger.warning("lm_head에 weight가 없음, 가중치 초기화 필요")
+                    # 필요한 경우 가중치 초기화 로직 추가
+
+    # 특수 토큰 ID 목록
+    special_token_ids = [
+        tokenizer.bos_token_id, 
+        tokenizer.eos_token_id, 
+        tokenizer.pad_token_id,
+        *[tokenizer.convert_tokens_to_ids(t) for t in SPECIAL_TOKENS.values()]
+    ]
+    
+    # 최종 콜백 목록 생성
+    callbacks = [
+        EarlyStoppingCallback(
+            early_stopping_patience=args.patience,
+            early_stopping_threshold=0.0
+        ),
+        TokenEmbeddingCallback(tokenizer, special_token_ids)
+    ]
+
     trainer = Seq2SeqTrainer(
-        model=model,
+        model=model,  # 초기 모델 (학습 전용)
         args=t_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.patience), PerplexityCallback()],
+        callbacks=callbacks,
     )
 
     # --------------------- 초기 모델(epoch 0) 평가 ---------------------
@@ -368,21 +457,42 @@ def main():
         test_ppl = float(np.exp(test_out.metrics.get('init_test_loss', 0)))
         logger.info(f"Initial Test Perplexity: {test_ppl:.4f}")
         
+        # 샘플 저장용 원본 텍스트 (MultiESC 전처리 전)
+        lbl_ids = test_out.label_ids.copy()
+        lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
+        
+        gen_raw = tokenizer.batch_decode(test_out.predictions, skip_special_tokens=True)
+        ref_raw = tokenizer.batch_decode(lbl_ids, skip_special_tokens=True)
+        
+        # 메트릭 계산용 텍스트 (MultiESC 스타일 전처리)
+        gen_txt = []
+        ref_txt = []
+        for gen, ref in zip(gen_raw, ref_raw):
+            gen_processed = ' '.join(nltk.word_tokenize(gen.lower()))
+            ref_processed = ' '.join(nltk.word_tokenize(ref.lower()))
+            gen_txt.append(gen_processed)
+            ref_txt.append(ref_processed)
+            
+        # 메트릭 계산
+        text_metrics = generation_metrics(gen_txt, ref_txt)
+        
+        # 메트릭 저장
+        init_test_metrics = {}
+        for k, v in text_metrics.items():
+            init_test_metrics[f'init_test_{k}'] = v
+        init_test_metrics.update(test_out.metrics)
+        init_test_metrics['init_test_perplexity'] = test_ppl
+        
         # 결과 저장
         init_test_path = Path(args.output_dir) / "init_test_metrics.json"
         with init_test_path.open("w", encoding="utf-8") as f:
             json.dump({k: float(v) if isinstance(v, (int, float, np.number)) else v 
-                       for k, v in test_out.metrics.items()}, f, indent=2)
+                       for k, v in init_test_metrics.items()}, f, indent=2)
         
-        # 샘플 저장
-        lbl_ids = test_out.label_ids.copy()
-        lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
-        gen_txt = tokenizer.batch_decode(test_out.predictions, skip_special_tokens=False)
-        ref_txt = tokenizer.batch_decode(lbl_ids, skip_special_tokens=False)
-        
-        sample_n = min(10, len(gen_txt))
+        # 샘플 저장 (원본 텍스트로 저장)
+        sample_n = min(10, len(gen_raw))
         with open(Path(args.output_dir) / "init_samples.txt", "w", encoding="utf-8") as f:
-            for i, (ref, gen) in enumerate(zip(ref_txt[:sample_n], gen_txt[:sample_n])):
+            for i, (ref, gen) in enumerate(zip(ref_raw[:sample_n], gen_raw[:sample_n])):
                 context = test_ds.examples[i]["context"]
                 f.write(f"CONTEXT: {context}\nREF: {ref}\nGEN: {gen}\n---\n")
         
@@ -391,11 +501,17 @@ def main():
     # 학습 수행 (eval_only가 True면 학습 건너뜀)
     if not args.eval_only:
         trainer.train()
-        trainer.save_model(args.output_dir)
+        
+        # 학습 완료 후 저장 - 중요: 안전한 방식으로 저장
+        # safe_serialization=True는 미래 호환성을 위한 옵션
+        model_path = Path(args.output_dir)
+        model.save_pretrained(model_path, safe_serialization=True)
+        tokenizer.save_pretrained(model_path)
+        
+        logger.info(f"Model explicitly saved to {args.output_dir}")
         
         # --------------------- test split 평가 ---------------------
         logger.info("테스트 데이터셋 평가 중...")
-
 
         # 테스트 데이터 평가
         test_out = trainer.predict(test_ds, metric_key_prefix="test")
@@ -404,23 +520,40 @@ def main():
         test_ppl = float(np.exp(test_out.metrics.get('test_loss', 0)))
         logger.info(f"Test Perplexity: {test_ppl:.4f}")
 
+        # 샘플 저장용 원본 텍스트 (MultiESC 전처리 전)
+        lbl_ids = test_out.label_ids.copy()
+        lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
+        
+        gen_raw = tokenizer.batch_decode(test_out.predictions, skip_special_tokens=True)
+        ref_raw = tokenizer.batch_decode(lbl_ids, skip_special_tokens=True)
+        
+        # 메트릭 계산용 텍스트 (MultiESC 스타일 전처리)
+        gen_txt = []
+        ref_txt = []
+        for gen, ref in zip(gen_raw, ref_raw):
+            gen_processed = ' '.join(nltk.word_tokenize(gen.lower()))
+            ref_processed = ' '.join(nltk.word_tokenize(ref.lower()))
+            gen_txt.append(gen_processed)
+            ref_txt.append(ref_processed)
+
+        # 메트릭 계산
+        text_metrics = generation_metrics(gen_txt, ref_txt)
+        
         # 메트릭 저장
-        test_metrics = test_out.metrics
+        test_metrics = {}
+        for k, v in text_metrics.items():
+            test_metrics[f'test_{k}'] = v
+        test_metrics.update(test_out.metrics)
         test_metrics['test_perplexity'] = test_ppl
         
         with open(Path(args.output_dir) / "test_metrics.json", "w") as f:
             json.dump({k: float(v) if isinstance(v, (int, float, np.number)) else v 
                        for k, v in test_metrics.items()}, f, indent=2)
 
-        # 샘플 저장
-        lbl_ids = test_out.label_ids.copy()
-        lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
-        gen_txt = tokenizer.batch_decode(test_out.predictions, skip_special_tokens=False)
-        ref_txt = tokenizer.batch_decode(lbl_ids, skip_special_tokens=False)
-
-        sample_n = min(20, len(gen_txt))
+        # 샘플 저장 (원본 텍스트로 저장)
+        sample_n = min(20, len(gen_raw))
         with open(Path(args.output_dir) / "test_samples.txt", "w", encoding="utf-8") as f:
-            for i, (ref, gen) in enumerate(zip(ref_txt[:sample_n], gen_txt[:sample_n])):
+            for i, (ref, gen) in enumerate(zip(ref_raw[:sample_n], gen_raw[:sample_n])):
                 context = test_ds.examples[i]["context"]
                 f.write(f"CONTEXT: {context}\nREF: {ref}\nGEN: {gen}\n---\n")
 
