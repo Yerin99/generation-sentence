@@ -7,16 +7,16 @@ BART 모델을 사용하여 대화 맥락에서 자연스러운 응답을 생성
 사용법 예시:
 ----------
 # 기본 훈련
-CUDA_VISIBLE_DEVICES=1 python bart_dialog_generator.py --output_dir outputs/dialog_generation_edit
+CUDA_VISIBLE_DEVICES=2 python bart_dialog_generator.py --batch_size 8 --gradient_accumulation_steps 2 --output_dir outputs/dialog_generation_epoch_10_grad_2_batch_8
 
 # 작은 비율의 데이터로 빠른 테스트
 CUDA_VISIBLE_DEVICES=0 python bart_dialog_generator.py --tiny_frac 0.01 --epochs 1 --output_dir outputs/dialog_tiny_test
 
 # facebook/bart-base 원본 모델 평가
-CUDA_VISIBLE_DEVICES=3 python bart_dialog_generator.py --eval_only --output_dir outputs/dialog_eval
+CUDA_VISIBLE_DEVICES=2 python bart_dialog_generator.py --eval_only --output_dir outputs/dialog_eval
 
 # 그래디언트 누적을 사용한 대용량 배치 학습 (실효 배치 크기 32)
-CUDA_VISIBLE_DEVICES=2 python bart_dialog_generator.py --batch_size 16 --gradient_accumulation_steps 2 --output_dir outputs/dialog_large_batch
+CUDA_VISIBLE_DEVICES=3 python bart_dialog_generator.py --gradient_accumulation_steps 2 --output_dir outputs/dialog_batch_32
 """
 
 from __future__ import annotations
