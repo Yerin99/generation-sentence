@@ -10,7 +10,7 @@ BART 모델을 사용하여 대화 맥락에서 자연스러운 응답을 생성
 CUDA_VISIBLE_DEVICES=2 python bart_dialog_generator.py --batch_size 8 --gradient_accumulation_steps 2 --output_dir outputs/dialog_generation_epoch_10_grad_2_batch_8
 
 # 작은 비율의 데이터로 빠른 테스트
-CUDA_VISIBLE_DEVICES=0 python bart_dialog_generator.py --tiny_frac 0.01 --epochs 1 --output_dir outputs/dialog_tiny_test
+CUDA_VISIBLE_DEVICES=0 python bart_dialog_generator.py --tiny_frac 0.05 --epochs 1 --eval_steps 10 --output_dir outputs/dialog_tiny_test
 
 # facebook/bart-base 원본 모델 평가
 CUDA_VISIBLE_DEVICES=2 python bart_dialog_generator.py --eval_only --output_dir outputs/dialog_eval
@@ -311,7 +311,7 @@ def main():
         logging_steps=args.eval_steps,
         predict_with_generate=True,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",  # eval_ppl 대신 eval_loss 직접 사용
+        metric_for_best_model="eval_loss",
         greater_is_better=False,  # loss는 낮을수록 좋음
         report_to="none",
         seed=args.seed,
@@ -332,10 +332,6 @@ def main():
 
         # 메트릭 딕셔너리 초기화
         metrics = {}
-        
-        if hasattr(eval_pred, "loss") and eval_pred.loss is not None:
-            metrics["eval_loss"] = eval_pred.loss
-            metrics["eval_ppl"] = float(np.exp(eval_pred.loss))
 
         # 텍스트로 디코딩
         gen_raw = tokenizer.batch_decode(preds, skip_special_tokens=True)
@@ -357,12 +353,6 @@ def main():
         # 평가 메트릭에 "eval_" 접두사 추가
         for k, v in text_metrics.items():
             metrics[f'eval_{k}'] = v
-
-        logger.info(
-            f"📊 Eval Metrics: BLEU-1={metrics.get('eval_bleu1', 0):.4f}, "
-            f"ROUGE-L={metrics.get('eval_rouge_l', 0):.4f}, "
-            f"PPL={metrics.get('eval_ppl', 0):.4f}"
-            )
 
         return metrics
 
