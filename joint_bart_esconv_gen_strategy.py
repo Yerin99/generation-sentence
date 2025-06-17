@@ -9,24 +9,24 @@ joint_bart_esconv_gen_strategy.py
 # 자연어 전략 프리픽스
 CUDA_VISIBLE_DEVICES=2 python joint_bart_esconv_gen_strategy.py \
     --eval_init \
-    --strategy_mode natural --ctx_strategy_rep natural --epochs 10 --output_dir outputs/natural_edit
+    --strategy_mode natural --ctx_strategy_rep natural --epochs 10 --output_dir outputs/natural_nltk
 
 # 특수 토큰 전략 프리픽스
 CUDA_VISIBLE_DEVICES=3 python joint_bart_esconv_gen_strategy.py \
     --eval_init \
-    --strategy_mode token --ctx_strategy_rep token --epochs 10 --output_dir outputs/token_edit
+    --strategy_mode token --ctx_strategy_rep token --epochs 10 --output_dir outputs/token_nltk
 
 # 자연어 전략 + tiny 1% + patience 3
 CUDA_VISIBLE_DEVICES=2 python joint_bart_esconv_gen_strategy.py \
-    --strategy_mode natural --tiny_frac 0.01 --epochs 1\
-    --eval_steps 10 --patience 3 --ctx_strategy_rep natural\
-    --output_dir outputs/tiny_natural
+    --strategy_mode natural --tiny_frac 0.05 --epochs 1\
+    --eval_steps 20 --patience 3 --ctx_strategy_rep natural\
+    --output_dir outputs/tiny_natural_nltk
 
 # 특수 토큰 전략 + tiny 1% + patience 3
 CUDA_VISIBLE_DEVICES=3 python joint_bart_esconv_gen_strategy.py \
-    --strategy_mode token --tiny_frac 0.01 --epochs 1 \
-    --eval_steps 10 --patience 3 --ctx_strategy_rep token\
-    --output_dir outputs/tiny_token
+    --strategy_mode token --tiny_frac 0.05 --epochs 1 \
+    --eval_steps 20 --patience 3 --ctx_strategy_rep token\
+    --output_dir outputs/tiny_token_nltk
 """
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from typing import Dict, List
 
 import numpy as np
 import torch
+import nltk
 from datasets import load_dataset
 from transformers import (
     BartTokenizer,
@@ -45,6 +46,8 @@ from transformers import (
     DataCollatorForSeq2Seq,
     EarlyStoppingCallback,
     TrainerCallback,
+    GenerationConfig,
+    BartConfig,
     set_seed,
 )
 from utils.metrics import generation_metrics, add_strategy_metrics
@@ -53,7 +56,6 @@ from utils.strategy import (
     parse_strategy_from_ids, strip_strategy_prefix,
     to_refined, safe_decode,
 )
-from tokenizers import AddedToken   # NEW (slow-tokenizer 사용 시 무시돼도 안전)
 
 # ===================== 전역 정의 =====================
 SPECIAL_TOKENS = {          # 대화 문맥용 역할 토큰
@@ -148,7 +150,7 @@ class ESConvGenDataset(torch.utils.data.Dataset):
                     else:
                         ctx_parts.append(f"{spk_tok} {prev['text']}")
 
-                context = " ".join(ctx_parts)
+                context = tokenizer.eos_token.join(ctx_parts)
 
                 # ---------- decoder label ----------
                 prefix = build_prefix(sid, self.mode)
@@ -158,10 +160,12 @@ class ESConvGenDataset(torch.utils.data.Dataset):
                 enc = self.tok(context,
                                max_length=self.max_src,
                                truncation=True,
+                               add_special_tokens=True,
                                padding="max_length")
                 dec = self.tok(tgt_text,
                                max_length=self.max_tgt,
                                truncation=True,
+                               add_special_tokens=True,
                                padding="max_length")
 
                 # label -100 masking
@@ -185,20 +189,34 @@ class ESConvGenDataset(torch.utils.data.Dataset):
 
 
 # ===================== 유틸 함수 =====================
-def safe_batch_decode(ids, tokenizer, **kwargs):
-    """범위를 벗어난 ID를 UNK로 치환하여 안전하게 디코딩"""
+def safe_batch_decode(ids, tokenizer, skip_special_tokens=False, **kwargs):
+    """배열/텐서(batch) 디코딩 시 pad 토큰만 제거하고, 원할 경우 다른 special token은 유지.
+
+    Args:
+        ids (np.ndarray | list[List[int]] | torch.Tensor): 배치 토큰 ID
+        tokenizer: Huggingface tokenizer
+        skip_special_tokens (bool): True면 special token 모두 제거, False면 pad만 제거
+    """
     # numpy 배열로 변환
     ids_array = np.asarray(ids)
-    
-    # 범위를 벗어난 ID 마스킹 (음수 또는 어휘 크기 이상)
-    invalid_mask = (ids_array < 0) | (ids_array >= len(tokenizer))
-    
-    # 마스킹된 위치가 있으면 복사 후 UNK로 대체
-    if invalid_mask.any():
-        ids_array = ids_array.copy()
-        ids_array[invalid_mask] = tokenizer.unk_token_id
-        
-    return tokenizer.batch_decode(ids_array, **kwargs)
+
+    # 1) pad 토큰 제거용 마스킹
+    pad_id = tokenizer.pad_token_id
+    if skip_special_tokens:
+        # Huggingface 옵션 사용 (pad 포함 모든 special 제거)
+        return tokenizer.batch_decode(ids_array, skip_special_tokens=True, **kwargs)
+
+    # skip_special_tokens=False 인 경우 → pad 토큰만 제거
+    decoded = []
+    for seq in ids_array:
+        # -100 라벨이나 음수값은 pad로 대체
+        seq = [pad_id if t == -100 else int(t) for t in seq]
+        # pad 토큰 앞까지만 사용
+        if pad_id in seq:
+            seq = seq[: seq.index(pad_id)]
+
+        decoded.append(tokenizer.decode(seq, skip_special_tokens=False, **kwargs))
+    return decoded
 
 
 # ===================== 메인 =====================
@@ -208,6 +226,8 @@ def main():
     parser.add_argument("--output_dir", type=str, default="outputs/decoder")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="그래디언트 누적 스텝(실효 배치 크기 = batch_size * gradient_accumulation_steps)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tiny_frac", type=float, default=None, help="0~1: 디버그용 샘플 비율")
     parser.add_argument("--patience", type=int, default=5,
@@ -219,13 +239,12 @@ def main():
     parser.add_argument("--ctx_strategy_rep", choices=["token", "natural", "none"], 
                         default="token",
                         help="과거 system 턴에 전략을 어떻게 표기할지")
+    parser.add_argument("--max_src_len", type=int, default=1024,
+                        help="인코더 입력 최대 길이 (BART 한계 1024)")
     parser.add_argument("--eval_init", action="store_true", 
                         help="학습 전 초기 모델(epoch 0)에서 평가 수행")
     parser.add_argument("--eval_only", action="store_true",
                         help="학습 없이 평가만 수행")
-    parser.add_argument("--metric_for_best_model", type=str, default="ppl",
-                        choices=["eval_loss", "ppl", "strategy_accuracy", "bleu1"],
-                        help="Best model 선정 기준 메트릭")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -237,28 +256,55 @@ def main():
 
     # 토크나이저 및 모델 초기화
     tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
+    tokenizer.truncation_side = "left"
     
     # *** 특수 토큰 추가 ***
     added = add_esconv_special_tokens(tokenizer)
     logger.info(f"{added} special tokens added (raw+space variants)")
     
-    model = BartForConditionalGeneration.from_pretrained("facebook/bart-base")
+    # 모델 로드 시 config 내 generation 파라미터 제거(경고 방지)
+    model_cfg = BartConfig.from_pretrained("facebook/bart-base")
+    for p in [
+        "num_beams", "max_length", "early_stopping", "no_repeat_ngram_size",
+        "length_penalty", "forced_bos_token_id", "forced_eos_token_id"
+    ]:
+        if hasattr(model_cfg, p):
+            delattr(model_cfg, p)
+
+    model = BartForConditionalGeneration.from_pretrained("facebook/bart-base", config=model_cfg, ignore_mismatched_sizes=True)
     # 임베딩 크기 확장 (특수 토큰 수용)
     model.resize_token_embeddings(len(tokenizer))
+
+    # GenerationConfig 설정
+    generation_config = GenerationConfig(
+        max_length=128,
+        num_beams=5,
+        early_stopping=True,
+        no_repeat_ngram_size=3,
+        length_penalty=1.0,
+        repetition_penalty=1.2,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    model.generation_config = generation_config
 
     # -------- dataset --------
     train_ds = ESConvGenDataset(
         "train", tokenizer, args.strategy_mode, 
+        max_src=args.max_src_len,
         tiny_frac=args.tiny_frac,
         ctx_strategy_rep=args.ctx_strategy_rep
     )
     val_ds = ESConvGenDataset(
         "validation", tokenizer, args.strategy_mode, 
+        max_src=args.max_src_len,
         tiny_frac=args.tiny_frac,
         ctx_strategy_rep=args.ctx_strategy_rep
     )
     test_ds = ESConvGenDataset(
         "test", tokenizer, args.strategy_mode, 
+        max_src=args.max_src_len,
         tiny_frac=args.tiny_frac,
         ctx_strategy_rep=args.ctx_strategy_rep
     )
@@ -266,21 +312,17 @@ def main():
     data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding="longest")
 
     # -------- training args --------
-    # metric_for_best_model 매핑 (ppl -> eval_ppl)
-    best_metric_key = args.metric_for_best_model
-    if args.metric_for_best_model == "ppl":
-        best_metric_key = "eval_ppl"
-    
-    # greater_is_better 설정
-    greater_is_better = True
-    if best_metric_key in ["eval_ppl", "eval_loss"]:
-        greater_is_better = False
+    # 실제 배치 크기 계산 (로깅용)
+    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
+    logger.info(f"배치 크기(per_device): {args.batch_size}, gradient_accumulation_steps: {args.gradient_accumulation_steps}")
+    logger.info(f"실효 배치 크기: {effective_batch_size}")
 
     t_args = Seq2SeqTrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_strategy="steps",
@@ -289,23 +331,14 @@ def main():
         logging_strategy="steps",
         logging_steps=args.eval_steps,
         predict_with_generate=True,
-        generation_max_length=128,
-        generation_num_beams=5,
         load_best_model_at_end=True,
-        metric_for_best_model=best_metric_key,
-        greater_is_better=greater_is_better,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         report_to="none",
         seed=args.seed,
+        skip_memory_metrics=True,
+        dataloader_drop_last=False,
     )
-
-    # -------- Callback for PPL --------
-    class PerplexityCallback(TrainerCallback):
-        """Eval 루프 이후 metrics dict에 eval_ppl 키를 추가한다."""
-        def on_evaluate(self, args, state, control, **kwargs):
-            metrics = kwargs.get("metrics", {})
-            if metrics is not None and "eval_loss" in metrics:
-                metrics["eval_ppl"] = float(np.exp(metrics["eval_loss"]))
-            return control
 
     # -------- training args --------
     trainer = Seq2SeqTrainer(
@@ -314,9 +347,14 @@ def main():
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=data_collator,
-        tokenizer=tokenizer,
         compute_metrics=build_compute_metrics(val_ds, tokenizer, args),
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.patience), PerplexityCallback()],
+        callbacks=[
+            EarlyStoppingCallback(
+                early_stopping_patience=args.patience,
+                early_stopping_threshold=0.0
+            ),
+            TokenEmbeddingCallback(tokenizer)
+        ],
     )
 
     # --------------------- 초기 모델(epoch 0) 평가 ---------------------
@@ -335,17 +373,8 @@ def main():
         # 테스트 데이터셋 평가
         logger.info("📊 Evaluating initial model on test split ...")
         
-        # 생성 파라미터
-        gen_kwargs = {
-            "num_beams": 5,
-            "early_stopping": True,
-            "no_repeat_ngram_size": 3,
-            "length_penalty": 1.0,
-            "repetition_penalty": 1.2,
-        }
-        
         # 테스트셋 평가
-        test_out = trainer.predict(test_ds, metric_key_prefix="init_test", **gen_kwargs)
+        test_out = trainer.predict(test_ds, metric_key_prefix="init_test")
         
         # PPL 계산
         test_ppl = float(np.exp(test_out.metrics.get('init_test_loss', 0)))
@@ -355,11 +384,13 @@ def main():
         lbl_ids = test_out.label_ids.copy()
         lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
         
-        gen_txt = [strip_strategy_prefix(t, args.strategy_mode)
-                for t in safe_batch_decode(test_out.predictions, tokenizer, skip_special_tokens=True)]
-        ref_txt = [strip_strategy_prefix(t, args.strategy_mode)
-                for t in safe_batch_decode(lbl_ids, tokenizer, skip_special_tokens=True)]
-        
+        gen_txt_raw = [strip_strategy_prefix(t, args.strategy_mode)
+                      for t in safe_batch_decode(test_out.predictions, tokenizer, skip_special_tokens=True)]
+        ref_txt_raw = [strip_strategy_prefix(t, args.strategy_mode)
+                      for t in safe_batch_decode(lbl_ids, tokenizer, skip_special_tokens=True)]
+
+        gen_txt = [' '.join(nltk.word_tokenize(t.lower())) for t in gen_txt_raw]
+        ref_txt = [' '.join(nltk.word_tokenize(t.lower())) for t in ref_txt_raw]
         gen_m = generation_metrics(gen_txt, ref_txt)
         
         # 전략 메트릭 계산
@@ -405,23 +436,17 @@ def main():
     # 학습 수행 (eval_only가 True면 학습 건너뜀)
     if not args.eval_only:
         trainer.train()
-        trainer.save_model(args.output_dir)
+        # 안전한 포맷으로 모델/토크나이저 저장
+        model_path = Path(args.output_dir)
+        model.save_pretrained(model_path, safe_serialization=True)
+        tokenizer.save_pretrained(model_path)
+        logger.info(f"Model saved to {args.output_dir}")
         
         # --------------------- test split 평가 ---------------------
         logger.info("evaluating on test split …")
 
-        # 생성 파라미터 설정
-        gen_kwargs = {
-            "num_beams": 5,
-            "early_stopping": True,  # EOS 토큰 생성 시 중단
-            "no_repeat_ngram_size": 3,
-            "length_penalty": 1.0,  
-            "repetition_penalty": 1.2,
-        }
-
-        # 1) loss/runtime 만 위해 metrics 잠시 비활성화
-        trainer.compute_metrics = None
-        test_out = trainer.predict(test_ds, metric_key_prefix="test", **gen_kwargs)
+        # 테스트셋 평가
+        test_out = trainer.predict(test_ds, metric_key_prefix="test")
 
         # PPL 계산
         test_ppl = float(np.exp(test_out.metrics.get('test_loss', 0)))
@@ -431,11 +456,13 @@ def main():
         lbl_ids = test_out.label_ids.copy()
         lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
 
-        gen_txt = [strip_strategy_prefix(t, args.strategy_mode)
-                   for t in safe_batch_decode(test_out.predictions, tokenizer, skip_special_tokens=True)]
-        ref_txt = [strip_strategy_prefix(t, args.strategy_mode)
-                   for t in safe_batch_decode(lbl_ids, tokenizer, skip_special_tokens=True)]
+        gen_txt_raw = [strip_strategy_prefix(t, args.strategy_mode)
+                      for t in safe_batch_decode(test_out.predictions, tokenizer, skip_special_tokens=True)]
+        ref_txt_raw = [strip_strategy_prefix(t, args.strategy_mode)
+                      for t in safe_batch_decode(lbl_ids, tokenizer, skip_special_tokens=True)]
 
+        gen_txt = [' '.join(nltk.word_tokenize(t.lower())) for t in gen_txt_raw]
+        ref_txt = [' '.join(nltk.word_tokenize(t.lower())) for t in ref_txt_raw]
         gen_m = generation_metrics(gen_txt, ref_txt)
 
         sid_pred, sid_gt = [], []
@@ -494,14 +521,43 @@ def main():
                 "First tokens: {}\n"
                 "strategy_id: {}\n{}".format(
                     i,
-                    textwrap.fill(ctx_plain, 120),
+                    ctx_plain,
                     tgt_plain,
                     first_tokens,
                     ex["strategy_id"],
                     "=" * 60
                 )
             )
-        return
+
+    # ----- 추가: 샘플 생성 테스트 -----
+    if args.show_samples and not args.eval_only:
+        logger.info("\n===== 생성 샘플 테스트 =====")
+        model.eval()
+        for i in random.sample(range(len(val_ds)), min(3, len(val_ds))):
+            ex = val_ds[i]
+            input_ids = torch.tensor([ex["input_ids"]]).to(model.device)
+            attention_mask = torch.tensor([ex["attention_mask"]]).to(model.device)
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_length=128,
+                )
+
+            gen_text = safe_decode(outputs[0].tolist(), tokenizer, skip_special_tokens=False)
+            tgt_text = safe_decode([t if t != -100 else tokenizer.pad_token_id for t in ex["labels"]], tokenizer, skip_special_tokens=False)
+            ctx_text = safe_decode(ex["input_ids"], tokenizer, skip_special_tokens=False)
+
+            logger.info(
+                f"\n----- 생성 샘플 {i} -----\n"
+                f"컨텍스트:\n{ctx_text}\n\n"
+                f"타겟:\n{tgt_text}\n\n"
+                f"생성:\n{gen_text}\n"
+                + "-"*60
+            )
+
+    return
 
 
 def add_esconv_special_tokens(tokenizer):
@@ -516,7 +572,7 @@ def add_esconv_special_tokens(tokenizer):
     num_added = tokenizer.add_special_tokens(special_tokens_dict)
     
     # 3. 토큰이 제대로 추가됐는지 검증
-    for token in STRAT_TOKENS[:2]:
+    for token in STRAT_TOKENS[:]:
         token_id = tokenizer.convert_tokens_to_ids(token)
         is_special = token_id in tokenizer.all_special_ids
         logger.info(f"Token: {token} -> ID: {token_id} (special={is_special})")
@@ -529,19 +585,20 @@ def build_compute_metrics(eval_dataset, tokenizer, args):
         preds, labels = eval_pred
         labels[labels == -100] = tokenizer.pad_token_id
 
-        metrics = {}
+        metrics = {}        
+        # ── 텍스트 메트릭 ─────────────────────
+        gen_txt_raw = [strip_strategy_prefix(t, args.strategy_mode)
+                      for t in safe_batch_decode(preds, tokenizer, skip_special_tokens=True)]
+        ref_txt_raw = [strip_strategy_prefix(t, args.strategy_mode)
+                      for t in safe_batch_decode(labels, tokenizer, skip_special_tokens=True)]
 
-        # 1) 텍스트 메트릭
-        gen_txt = [strip_strategy_prefix(t, args.strategy_mode)
-                   for t in safe_batch_decode(preds, tokenizer, skip_special_tokens=True)]
-        ref_txt = [strip_strategy_prefix(t, args.strategy_mode)
-                   for t in safe_batch_decode(labels, tokenizer, skip_special_tokens=True)]
-        gen_m = generation_metrics(gen_txt, ref_txt)
-        metrics.update(gen_m)
-        for k, v in list(gen_m.items()):
-            metrics[f'eval_{k}'] = v
+        gen_txt = [' '.join(nltk.word_tokenize(t.lower())) for t in gen_txt_raw]
+        ref_txt = [' '.join(nltk.word_tokenize(t.lower())) for t in ref_txt_raw]
+        text_metrics = generation_metrics(gen_txt, ref_txt)
+        for k, v in text_metrics.items():
+            metrics[f"eval_{k}"] = v
 
-        # 2) 전략 메트릭
+        # ── 전략 메트릭 ───────────────────────
         sid_pred, sid_gt = [], []
         for p_ids, ex in zip(preds, eval_dataset.examples):
             sid = parse_strategy_from_ids(p_ids, tokenizer, args.strategy_mode)
@@ -550,20 +607,39 @@ def build_compute_metrics(eval_dataset, tokenizer, args):
             sid_pred.append(sid)
             sid_gt.append(ex["strategy_id"])
         strat_metrics = add_strategy_metrics({}, sid_pred, sid_gt)
-        metrics.update(strat_metrics)
-        for k, v in list(strat_metrics.items()):
+        for k, v in strat_metrics.items():
             metrics[f'eval_{k}'] = v
 
-        # 로그
         from sklearn.metrics import classification_report
         report = classification_report(sid_gt, sid_pred, labels=list(range(len(STRATEGIES))), target_names=STRATEGIES, digits=2, zero_division=0)
         logging.info("\n" + report)
-
-        logging.info(
-            f"📊 Eval Metrics: BLEU-1={metrics['eval_bleu1']:.4f}, Strategy Acc={metrics['eval_strategy_accuracy']:.4f}")
-
+ 
         return metrics
     return compute_metrics
+
+
+# ---- 체크포인트 로드 시 임베딩 크기 보정 콜백 ----
+class TokenEmbeddingCallback(TrainerCallback):
+    """체크포인트 로드 등 이벤트에서 토큰 임베딩 크기 불일치 해결"""
+    def __init__(self, tokenizer):
+        self.tok = tokenizer
+
+    def _ensure_size(self, model):
+        if model.get_input_embeddings().weight.shape[0] != len(self.tok):
+            logger.warning(f"임베딩 크기 불일치 -> resize {model.get_input_embeddings().weight.shape[0]} -> {len(self.tok)}")
+            model.resize_token_embeddings(len(self.tok))
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if model is not None:
+            self._ensure_size(model)
+
+    def on_load_checkpoint(self, args, state, control, model=None, **kwargs):
+        if model is not None:
+            self._ensure_size(model)
+
+    def on_checkpoint_model_loading(self, args, state, control, model=None, **kwargs):
+        if model is not None:
+            self._ensure_size(model)
 
 
 if __name__ == "__main__":
