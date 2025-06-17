@@ -21,13 +21,13 @@ CUDA_VISIBLE_DEVICES=3 python bart_dialog_generator.py --gradient_accumulation_s
 
 from __future__ import annotations
 
-import argparse, json, logging, random, os
+import argparse, json, logging, random
 from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
 import torch
-import nltk  # NLTK 추가
+import nltk
 from datasets import load_dataset
 from transformers import (
     BartTokenizer,
@@ -42,7 +42,6 @@ from transformers import (
     BartConfig,
 )
 from utils.metrics import generation_metrics
-from tokenizers import AddedToken
 
 # ===================== 전역 정의 =====================
 SPECIAL_TOKENS = {          # 대화 문맥용 역할 토큰
