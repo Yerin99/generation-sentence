@@ -237,8 +237,8 @@ def main():
                         help="사용할 데이터셋 (기본값: ESConv)")
     parser.add_argument("--learning_rate", type=float, default=3e-5,
                         help="학습률 (기본값: 3e-5, 큰 데이터셋은 5e-5도 가능)")
-    parser.add_argument("--max_src_length", type=int, default=896,
-                        help="최대 소스 길이 (기본값: 896)")
+    parser.add_argument("--max_src_length", type=int, default=1024,
+                        help="최대 소스 길이")
     parser.add_argument("--max_tgt_length", type=int, default=256,
                         help="최대 타겟 길이")
     parser.add_argument("--warmup_ratio", type=float, default=0.05,
