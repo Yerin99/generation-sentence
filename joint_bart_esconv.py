@@ -18,13 +18,13 @@ ESConv 전략 예측 + 응답 생성 Joint-Decoding 파이프라인
 # 1 GPU
 CUDA_VISIBLE_DEVICES=0 python joint_bart_esconv.py \
     --epochs 10 --batch_size 16 --lambda_cls 0.5 \
-    --clean_checkpoints \
+    --clean_checkpoints --eval_init \
     --output_dir outputs/joint
 
 # 1GPU, tiny check
-CUDA_VISIBLE_DEVICES=1 python joint_bart_esconv.py \
-        --epochs 3 --batch_size 4 --tiny_frac 0.01 --lambda_cls 1.0 \
-        --clean_checkpoints --output_dir outputs/sanity1gpu
+CUDA_VISIBLE_DEVICES=3 python joint_bart_esconv.py \
+        --epochs 3 --batch_size 4 --tiny_frac 0.01 --lambda_cls 0.5 \
+        --clean_checkpoints --eval_init --output_dir outputs/sanity1gpu
 """
 from __future__ import annotations
 
@@ -432,8 +432,11 @@ class JointTrainer(Seq2SeqTrainer):
         
         # BLEU-1과 strategy_accuracy가 있다면 로그 출력
         if "bleu1" in metrics and "strategy_accuracy" in metrics:
-            # epoch 정보가 있으면 함께 출력
-            epoch_info = f"Epoch {self.state.epoch:.2f}" if hasattr(self.state, "epoch") else "Evaluation"
+            # 이 부분을 수정 - epoch가 None인 경우 처리
+            if hasattr(self.state, "epoch") and self.state.epoch is not None:
+                epoch_info = f"Epoch {self.state.epoch:.2f}"
+            else:
+                epoch_info = "Evaluation"
             logger.info(
                 f"📊 {epoch_info} 메트릭: BLEU-1={metrics['bleu1']:.4f}, "
                 f"Strategy Accuracy={metrics['strategy_accuracy']:.4f}"
@@ -638,6 +641,7 @@ def main():
     ap.add_argument("--tiny_frac", type=float, default=None, help="데이터셋의 일부만 사용 (e.g., 0.01 = 1%)")
     ap.add_argument("--patience", type=int, default=3, help="early stopping patience (number of epochs without improvement)")
     ap.add_argument("--clean_checkpoints", action="store_true", help="학습 완료 후 체크포인트 폴더 정리")
+    ap.add_argument("--eval_init", action="store_true", help="학습 전 초기 모델(epoch 0)에서 평가 수행")
     args = ap.parse_args()
 
     # logging
@@ -651,6 +655,7 @@ def main():
 
     train_ds = JointESConvDataset("train", tokenizer)
     val_ds   = JointESConvDataset("validation", tokenizer)
+    test_ds  = JointESConvDataset("test", tokenizer)
 
     # -------------------------------------------------------------
     # tiny training option: 매우 작은 부분집합으로 epoch 속도 테스트
@@ -664,7 +669,8 @@ def main():
             return ds
         train_ds = _subset(train_ds, args.tiny_frac)
         val_ds   = _subset(val_ds, args.tiny_frac)
-        logging.info(f"[tiny] train={len(train_ds)}  val={len(val_ds)} examples (fraction={args.tiny_frac})")
+        test_ds  = _subset(test_ds, args.tiny_frac)  # 테스트셋도 동일하게 적용
+        logging.info(f"[tiny] train={len(train_ds)}  val={len(val_ds)}  test={len(test_ds)} examples (fraction={args.tiny_frac})")
 
     model = JointBart(tokenizer, lambda_cls=args.lambda_cls)
 
@@ -678,6 +684,7 @@ def main():
         learning_rate=args.lr,
         eval_strategy="epoch",
         save_strategy="epoch",
+        save_total_limit=1,    # 최신 체크포인트 1개만 유지
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
@@ -740,8 +747,119 @@ def main():
         callbacks=callbacks,
     )
 
+    # --------------------------- 초기 모델 (epoch 0) 평가 ---------------------------
+    if args.eval_init:
+        from sklearn.metrics import accuracy_score, f1_score, classification_report 
+        
+        logging.info("초기 모델(epoch 0) 평가 시작...")
+        
+        # -------------------------------------------------------------
+        # (1) 기본 loss 등               : trainer.evaluate
+        # (2) 생성 & 전략 메트릭 계산     : 직접 predict 후 계산
+        # -------------------------------------------------------------
+
+        # 1) loss 등 기본 메트릭
+        init_val_metrics = trainer.evaluate(val_ds, metric_key_prefix="init_val")
+        logging.info(f"초기 모델 validation 평가 결과: loss={init_val_metrics['init_val_loss']:.4f}")
+        
+        # validation PPL 계산
+        if "init_val_loss" in init_val_metrics:
+            init_val_metrics["init_val_perplexity"] = calculate_perplexity(init_val_metrics["init_val_loss"])
+            logging.info(f"초기 모델 Validation Perplexity: {init_val_metrics['init_val_perplexity']:.4f}")
+        
+        # 테스트셋 기본 메트릭
+        init_test_metrics = trainer.evaluate(test_ds, metric_key_prefix="init_test")
+        
+        # 테스트 PPL 계산
+        if "init_test_loss" in init_test_metrics:
+            init_test_metrics["init_test_perplexity"] = calculate_perplexity(init_test_metrics["init_test_loss"])
+            logging.info(f"초기 모델 Test Perplexity: {init_test_metrics['init_test_perplexity']:.4f}")
+        
+        # 2) 추가 메트릭 계산
+        logging.info("초기 모델 테스트셋 생성 & 전략 메트릭 계산 중...")
+        preds_init = trainer.predict(test_ds, metric_key_prefix="init_test")
+        
+        # generation metrics
+        gen_texts_init = safe_batch_decode(tokenizer, preds_init.predictions)
+        # label_ids → refs
+        lbl_ids = preds_init.label_ids.copy()
+        lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
+        refs_init = safe_batch_decode(tokenizer, lbl_ids)
+        gen_metrics_init = generation_metrics(gen_texts_init, refs_init)
+        
+        # 생성 메트릭 결과 출력
+        logging.info(f"초기 모델 생성 성능: BLEU={gen_metrics_init.get('bleu', 0):.4f}, ROUGE-L={gen_metrics_init.get('rouge_l', 0):.4f}")
+        
+        # strategy metrics (accuracy / weighted f1)
+        logging.info("초기 모델 전략 분류 메트릭 계산 중...")
+        strat_loader = torch.utils.data.DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            collate_fn=data_collator,
+            shuffle=False,
+        )
+        all_sid_pred_init, all_sid_gt_init = [], []
+        device_eval = next(model.parameters()).device
+        with torch.no_grad():
+            for batch in strat_loader:
+                sid_gt = batch.pop("strategy_id")
+                input_ids = batch["input_ids"].to(device_eval)
+                attention_mask = batch["attention_mask"].to(device_eval)
+                outs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outs.strategy_logits
+                sid_pred = torch.argmax(logits, dim=-1).cpu()
+                all_sid_pred_init.append(sid_pred)
+                all_sid_gt_init.append(sid_gt)
+        
+        all_sid_pred_init = torch.cat(all_sid_pred_init).numpy()
+        all_sid_gt_init = torch.cat(all_sid_gt_init).numpy()
+        strat_acc_init = accuracy_score(all_sid_gt_init, all_sid_pred_init)
+        strat_f1_init = f1_score(all_sid_gt_init, all_sid_pred_init, average="weighted")
+        
+        # 전략 분류 결과 출력
+        logging.info(f"초기 모델 전략 분류 성능: Accuracy={strat_acc_init:.4f}, F1={strat_f1_init:.4f}")
+        
+        # 전략별 상세 성능 보고서
+        from utils.strategy import STRATEGIES
+        init_strat_report = classification_report(
+            all_sid_gt_init, all_sid_pred_init,
+            labels=list(range(len(STRATEGIES))),
+            target_names=STRATEGIES,
+            digits=2,
+            zero_division=0
+        )
+        logging.info("\n=== 초기 모델 전략 분류 상세 보고서 ===\n" + init_strat_report)
+        
+        # 메트릭 통합
+        init_test_metrics.update({f"init_test_{k}": float(v) for k, v in gen_metrics_init.items()})
+        init_test_metrics.update({
+            "init_test_strategy_accuracy": float(strat_acc_init),
+            "init_test_strategy_f1": float(strat_f1_init),
+        })
+        
+        # 초기 테스트 메트릭 저장
+        Path(args.output_dir).mkdir(exist_ok=True, parents=True)
+        
+        # validation 메트릭 저장
+        init_val_path = Path(args.output_dir) / "init_val_metrics.json"
+        with init_val_path.open("w", encoding="utf-8") as f:
+            json.dump({k: float(v) for k, v in init_val_metrics.items()}, f, indent=2)
+        
+        # test 메트릭 저장
+        init_test_path = Path(args.output_dir) / "init_test_metrics.json"
+        with init_test_path.open("w", encoding="utf-8") as f:
+            json.dump({k: float(v) for k, v in init_test_metrics.items()}, f, indent=2)
+        
+        # 샘플 저장
+        sample_n = min(10, len(gen_texts_init))
+        with open(Path(args.output_dir) / "init_samples.txt", "w", encoding="utf-8") as f:
+            for ref, gen in zip(refs_init[:sample_n], gen_texts_init[:sample_n]):
+                f.write(f"REF: {ref}\nGEN: {gen}\n---\n")
+        
+        logging.info(f"초기 모델 평가 결과 저장 완료: {args.output_dir}")
+
     # --------------------------- train + save best ---------------------------------
-    train_result = trainer.train()
+    trainer.train()
 
     if trainer.is_world_process_zero():
         # 학습 종료 후 현재 모델을 best_model 디렉토리에 강제 저장
@@ -749,54 +867,6 @@ def main():
         logging.info(f"학습 완료: 현재 모델을 {best_model_dir}에 강제 저장합니다.")
         trainer.save_model(best_model_dir)
         
-        # 체크포인트 폴더 정리 (선택 사항)
-        if args.clean_checkpoints:
-            logging.info("체크포인트 폴더 정리 중...")
-            checkpoint_dirs = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint-")]
-            for checkpoint_dir in checkpoint_dirs:
-                checkpoint_path = os.path.join(args.output_dir, checkpoint_dir)
-                if os.path.isdir(checkpoint_path):
-                    logging.info(f"체크포인트 삭제: {checkpoint_path}")
-                    from shutil import rmtree
-                    rmtree(checkpoint_path)
-            logging.info("체크포인트 정리 완료")
-        
-        # best_model 디렉토리에서 최종 출력 디렉토리로 복사
-        logging.info(f"Best 모델을 {args.output_dir}에 최종 저장 중...")
-        from shutil import copytree, rmtree
-        best_model_dir = os.path.join(args.output_dir, "best_model")
-        
-        if os.path.exists(best_model_dir):
-            # 최종 출력 디렉토리의 파일들 삭제 (덮어쓰기 준비)
-            for item in os.listdir(args.output_dir):
-                if item != "best_model" and not item.startswith("checkpoint-") and not item.startswith("events.") and item != "train.log":
-                    item_path = os.path.join(args.output_dir, item)
-                    if os.path.isdir(item_path):
-                        rmtree(item_path)
-                    else:
-                        os.remove(item_path)
-            
-            # best_model의 내용을 args.output_dir로 복사
-            for item in os.listdir(best_model_dir):
-                src = os.path.join(best_model_dir, item)
-                dst = os.path.join(args.output_dir, item)
-                if os.path.isdir(src):
-                    if os.path.exists(dst):
-                        rmtree(dst)
-                    copytree(src, dst)
-                else:
-                    import shutil
-                    shutil.copy2(src, dst)
-            
-            logging.info(f"Best 모델을 {args.output_dir}에 최종 저장 완료!")
-            
-            # 복사 완료 후 best_model 디렉토리 삭제 (디스크 공간 절약)
-            logging.info(f"중복 저장 방지를 위해 {best_model_dir} 디렉토리 삭제...")
-            rmtree(best_model_dir)
-            logging.info(f"{best_model_dir} 디렉토리 삭제 완료!")
-        else:
-            logging.warning(f"Best 모델 디렉토리가 없습니다. 최종 모델 저장하지 않음.")
-
         # validation metrics dump
         metrics = trainer.evaluate()
         
