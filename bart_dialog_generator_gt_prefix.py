@@ -7,10 +7,10 @@ BART 모델을 사용하여 대화 맥락과 전략(strategy)을 기반으로 �
 사용법 예시:
 ----------
 # 기본 훈련
-CUDA_VISIBLE_DEVICES=1 python bart_dialog_generator_gt_prefix.py --batch_size 16 --output_dir outputs/dialog_generation_gt_prefix
+CUDA_VISIBLE_DEVICES=1 python bart_dialog_generator_gt_prefix.py --batch_size 16 --output_dir outputs/dialog_generation_gt_prefix --no_save_optimizer
 
 # 작은 비율의 데이터로 빠른 테스트
-CUDA_VISIBLE_DEVICES=1 python bart_dialog_generator_gt_prefix.py --tiny_frac 0.05 --epochs 1 --eval_steps 10 --output_dir outputs/dialog_tiny_gt_prefix
+CUDA_VISIBLE_DEVICES=2 python bart_dialog_generator_gt_prefix.py --tiny_frac 0.05 --epochs 1 --eval_steps 10 --output_dir outputs/dialog_tiny_gt_prefix --no_save_optimizer
 
 # facebook/bart-base 원본 모델 평가
 CUDA_VISIBLE_DEVICES=2 python bart_dialog_generator_gt_prefix.py --eval_only --output_dir outputs/dialog_eval_gt_prefix
@@ -182,22 +182,29 @@ class DialogGenDataset(torch.utils.data.Dataset):
 # ===================== 유틸 함수 =====================
 def safe_decode(ids, tokenizer, skip_special_tokens=False, **kwargs):
     """안전하게 디코딩하되, pad 토큰만 제외하고 다른 special token은 유지"""
+    # 리스트와 텐서를 모두 허용
+    if isinstance(ids, torch.Tensor):
+        ids = ids.tolist()
+
+    if not isinstance(ids, list):
+        ids = [ids]
+
+    # 1) pad 이후 자르기
+    if tokenizer.pad_token_id in ids:
+        first_pad = ids.index(tokenizer.pad_token_id)
+        ids = ids[:first_pad]
+
+    # 2) 음수/None/범위 초과 ID 제거
+    filtered = [int(t) for t in ids if isinstance(t, int) and 0 <= t < len(tokenizer)]
+
+    if not filtered:
+        return ""
+
     try:
-        # 먼저 pad 토큰의 위치 찾기
-        if isinstance(ids, list):
-            # pad 토큰이 시작되는 첫 위치 찾기
-            pad_positions = [i for i, id in enumerate(ids) if id == tokenizer.pad_token_id]
-            # pad 토큰이 있으면 첫 pad 토큰 전까지만 사용
-            ids_without_pad = ids[:pad_positions[0]] if pad_positions else ids
-            # 디코딩 시 특수 토큰 유지
-            return tokenizer.decode(ids_without_pad, skip_special_tokens=skip_special_tokens, **kwargs)
-        else:
-            return tokenizer.decode(ids, skip_special_tokens=skip_special_tokens, **kwargs)
+        return tokenizer.decode(filtered, skip_special_tokens=skip_special_tokens, **kwargs)
     except Exception as e:
-        logger.warning(f"디코딩 실패: {e}")
-        # 음수 및 범위 초과 ID 제거
-        valid_ids = [i for i in ids if i >= 0 and i < len(tokenizer)]
-        return tokenizer.decode(valid_ids, skip_special_tokens=skip_special_tokens, **kwargs)
+        logger.debug(f"safe_decode 재시도 실패: {e}")
+        return ""
 
 
 # ===================== 메인 =====================
@@ -240,6 +247,8 @@ def main():
                         help="학습/평가 중 출력할 샘플 수")
     parser.add_argument("--no_cache", action="store_true",
                         help="캐시를 사용하지 않고 항상 데이터를 새로 처리")
+    parser.add_argument("--no_save_optimizer", action="store_true",
+                        help="체크포인트 저장 시 optimizer/scheduler state를 저장하지 않음 (디스크/I-O 절약)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -310,6 +319,24 @@ def main():
     )
 
     data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding="longest")
+
+    # -------------------- Safe Trainer 정의 --------------------
+    from transformers import Trainer
+
+    class SafeSeq2SeqTrainer(Seq2SeqTrainer):
+        """RuntimeError 발생 시 optimizer state 저장을 건너뛰는 Trainer."""
+
+        def _save_optimizer_and_scheduler(self, output_dir: str):  # type: ignore
+            if args.no_save_optimizer:
+                logger.info("⚠️  no_save_optimizer 플래그가 설정되어 optimizer/scheduler state 저장을 건너뜁니다.")
+                return
+            try:
+                return super()._save_optimizer_and_scheduler(output_dir)
+            except RuntimeError as e:
+                logger.warning(f"optimizer/scheduler 저장 실패: {e}. 해당 스텝에서 저장을 건너뜁니다.")
+                # 메모리 문제 완화를 위해 캐시 비움
+                torch.cuda.empty_cache()
+                return
 
     # -------- training args --------
     t_args = Seq2SeqTrainingArguments(
@@ -431,7 +458,7 @@ def main():
         TokenEmbeddingCallback(tokenizer, special_token_ids)
     ]
 
-    trainer = Seq2SeqTrainer(
+    trainer = SafeSeq2SeqTrainer(
         model=model,  # 초기 모델 (학습 전용)
         args=t_args,
         train_dataset=train_ds,
