@@ -38,6 +38,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from datasets import load_dataset
+import nltk
+
+# NLTK 데이터 다운로드 (필요시)
+try:
+    nltk.data.find('tokenizers/punkt')
+except (LookupError, ImportError):
+    nltk.download('punkt')
+
 from sklearn.metrics import accuracy_score, f1_score, classification_report
 from tqdm.auto import tqdm
 
@@ -57,8 +65,6 @@ from transformers import (
 SPECIAL_TOKENS = {
     "usr": "[USR]",
     "sys": "[SYS]",
-    "sep": "[SEP]",
-    "hist": "[STRAT_HIST]",
     "strategy": "[STRATEGY]",
     "strategy_placeholder": "[STRATEGY_EMBEDDING]",  # NEW: dynamic strategy embedding placeholder
 }
@@ -82,7 +88,7 @@ logger = logging.getLogger("joint")
 class JointESConvDataset(torch.utils.data.Dataset):
     """시스템 턴 단위 예제 생성 + joint decoding 포맷"""
 
-    def __init__(self, split: str, tokenizer: BartTokenizer, max_src: int = 512, max_tgt: int = 64, cache_dir: str = "cache_joint"):
+    def __init__(self, split: str, tokenizer: BartTokenizer, max_src: int = 1024, max_tgt: int = 256, cache_dir: str = "cache_joint"):
         self.tok = tokenizer
         self.max_src = max_src
         self.max_tgt = max_tgt
@@ -109,13 +115,15 @@ class JointESConvDataset(torch.utils.data.Dataset):
                     if t["speaker"] == "sys":
                         st = t.get("strategy", "Others")
                         st_tok = f"[STRAT_{st.replace(' ', '_')}]"
-                        ctx_parts.append(f"{SPECIAL_TOKENS['strategy']} {st_tok} {spk_tok} {t['text']}")
+                        ctx_parts.append(f"{spk_tok}{st_tok}{t['text']}")
                     else:
-                        ctx_parts.append(f"{spk_tok} {t['text']}")
-                context = " ".join(ctx_parts)
+                        ctx_parts.append(f"{spk_tok}{t['text']}")
+
+                context = tokenizer.bos_token + (tokenizer.eos_token.join(ctx_parts) if ctx_parts else "") + tokenizer.eos_token
+
 
                 # decoder input = BOS STRAT_TOKEN response
-                d_in = f"{SPECIAL_TOKENS['strategy']} {SPECIAL_TOKENS['strategy_placeholder']} {SPECIAL_TOKENS['sys']} {turn['text']}"
+                d_in = SPECIAL_TOKENS["sys"] + SPECIAL_TOKENS['strategy_placeholder']+ turn["text"] + tokenizer.eos_token
 
                 examples.append({
                     "context": context,
@@ -143,7 +151,7 @@ class JointESConvDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         ex = self.examples[idx]
         enc = self.tok(
-            ex["context"], max_length=self.max_src, truncation=True, padding="max_length", return_tensors="pt"
+            ex["context"], max_length=self.max_src, truncation=True, padding="max_length", add_special_tokens=False, return_tensors="pt"
         )
         dec = self.tok(
             ex["decoder_text"], max_length=self.max_tgt, truncation=True, padding="max_length", add_special_tokens=False, return_tensors="pt"
@@ -382,12 +390,16 @@ class JointTrainer(Seq2SeqTrainer):
     def compute_metrics(self, eval_pred):
         """텍스트 생성 및 전략 분류 메트릭 계산"""
         import logging
+        import nltk
         logger = logging.getLogger("joint")
         
         preds, labels = eval_pred.predictions, eval_pred.label_ids
         
         # tokenizer 가져오기
         tok = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
+        if tok is None:
+            logger.warning("토크나이저를 찾을 수 없습니다. 메트릭 계산이 불가능합니다.")
+            return {}
         
         # 기본 메트릭 초기화
         metrics = {}
@@ -405,8 +417,23 @@ class JointTrainer(Seq2SeqTrainer):
                 lbl[lbl == -100] = tok.pad_token_id
                 refs_txt = safe_batch_decode(tok, lbl)
                 
+                # MultiESC 스타일 전처리: 소문자화 및 nltk 토큰화
+                proc_preds = []
+                proc_refs = []
+                for pred, ref in zip(preds_txt, refs_txt):
+                    # 소문자화 후 nltk 토큰화하여 공백으로 재결합
+                    try:
+                        pred_tokens = nltk.word_tokenize(pred.lower())
+                        ref_tokens = nltk.word_tokenize(ref.lower())
+                        proc_preds.append(' '.join(pred_tokens))
+                        proc_refs.append(' '.join(ref_tokens))
+                    except Exception as e:
+                        logger.warning(f"토큰화 실패: {e}, 원본 텍스트 사용")
+                        proc_preds.append(pred.lower())
+                        proc_refs.append(ref.lower())
+                
                 # 생성 메트릭 계산 및 추가
-                gen_m = generation_metrics(preds_txt, refs_txt)
+                gen_m = generation_metrics(proc_preds, proc_refs)
                 metrics.update(gen_m)
                 
             except Exception as e:
@@ -448,7 +475,7 @@ class JointTrainer(Seq2SeqTrainer):
         
         # 항상 현재 best model 저장 (첫 eval에서는 무조건 best)
         if current_metric is None:
-            logger.info(f"첫 번째 eval 결과, 모델 저장 (metric 없음)")
+            logger.info(f"첫 번째 eval 결과, 모델 저장")
             self._save_best_model()
         else:
             # current_metric이 있으면 더 좋은지 비교
@@ -650,7 +677,12 @@ def main():
                         handlers=[logging.FileHandler(Path(args.output_dir)/"train.log"), logging.StreamHandler()])
 
     set_seed(args.seed)
+
+    # 토크나이저 및 모델 초기화
     tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
+    tokenizer.truncation_side = "left"
+
+    # 특수 토큰 추가
     tokenizer.add_special_tokens({"additional_special_tokens": list(SPECIAL_TOKENS.values()) + STRAT_TOKENS})
 
     train_ds = JointESConvDataset("train", tokenizer)
@@ -685,11 +717,11 @@ def main():
         eval_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=1,    # 최신 체크포인트 1개만 유지
+        logging_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         predict_with_generate=True,
-        generation_max_length=64,
         report_to="none",
     )
 
@@ -742,7 +774,7 @@ def main():
         args=train_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,  # tokenizer 대신 processing_class 사용 (deprecated 경고 해결)
         data_collator=data_collator,
         callbacks=callbacks,
     )
@@ -785,7 +817,24 @@ def main():
         lbl_ids = preds_init.label_ids.copy()
         lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
         refs_init = safe_batch_decode(tokenizer, lbl_ids)
-        gen_metrics_init = generation_metrics(gen_texts_init, refs_init)
+        
+        # MultiESC 스타일 전처리: 소문자화 및 nltk 토큰화
+        proc_preds_init = []
+        proc_refs_init = []
+        for pred, ref in zip(gen_texts_init, refs_init):
+            # 소문자화 후 nltk 토큰화하여 공백으로 재결합
+            try:
+                pred_tokens = nltk.word_tokenize(pred.lower())
+                ref_tokens = nltk.word_tokenize(ref.lower())
+                proc_preds_init.append(' '.join(pred_tokens))
+                proc_refs_init.append(' '.join(ref_tokens))
+            except Exception as e:
+                logging.warning(f"토큰화 실패: {e}, 원본 텍스트 사용")
+                proc_preds_init.append(pred.lower())
+                proc_refs_init.append(ref.lower())
+        
+        # 전처리된 텍스트로 메트릭 계산
+        gen_metrics_init = generation_metrics(proc_preds_init, proc_refs_init)
         
         # 생성 메트릭 결과 출력
         logging.info(f"초기 모델 생성 성능: BLEU={gen_metrics_init.get('bleu', 0):.4f}, ROUGE-L={gen_metrics_init.get('rouge_l', 0):.4f}")
@@ -949,7 +998,24 @@ def main():
         lbl_ids = preds_full.label_ids.copy()
         lbl_ids[lbl_ids == -100] = tokenizer.pad_token_id
         refs_full = safe_batch_decode(tokenizer, lbl_ids)
-        gen_metrics = generation_metrics(gen_texts_full, refs_full)
+        
+        # MultiESC 스타일 전처리: 소문자화 및 nltk 토큰화
+        proc_preds_full = []
+        proc_refs_full = []
+        for pred, ref in zip(gen_texts_full, refs_full):
+            # 소문자화 후 nltk 토큰화하여 공백으로 재결합
+            try:
+                pred_tokens = nltk.word_tokenize(pred.lower())
+                ref_tokens = nltk.word_tokenize(ref.lower())
+                proc_preds_full.append(' '.join(pred_tokens))
+                proc_refs_full.append(' '.join(ref_tokens))
+            except Exception as e:
+                logging.warning(f"토큰화 실패: {e}, 원본 텍스트 사용")
+                proc_preds_full.append(pred.lower())
+                proc_refs_full.append(ref.lower())
+        
+        # 전처리된 텍스트로 메트릭 계산
+        gen_metrics = generation_metrics(proc_preds_full, proc_refs_full)
 
         # strategy metrics (accuracy / weighted f1)
         from sklearn.metrics import accuracy_score, f1_score
