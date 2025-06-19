@@ -4,6 +4,7 @@
 /cache_gen
 /cache_sasrec
 /cache_dialog_gen
+/cache_dialog_gen_gt_strategy
 
 */__pycache__
 */*/__pycache__
