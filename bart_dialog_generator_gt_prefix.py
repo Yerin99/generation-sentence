@@ -126,12 +126,7 @@ class DialogGenDataset(torch.utils.data.Dataset):
 
                 # ---------- decoder output (response) ----------
                 # 디코더 prefix: [SYS]  [STRAT_x]  + 실제 응답
-                tgt_text = (
-                    SPECIAL_TOKENS["sys"]
-                    + SPECIAL_TOKENS[turn["strategy"]]
-                    + turn["text"]
-                    + tokenizer.eos_token
-                )
+                tgt_text = SPECIAL_TOKENS["sys"] + SPECIAL_TOKENS[turn["strategy"]]+ turn["text"] + tokenizer.eos_token
 
                 # 2) add_special_tokens=False로 토크나이즈
                 enc = self.tok(
@@ -579,8 +574,8 @@ def main():
         for i in random.sample(range(len(train_ds)), args.show_samples):
             ex = train_ds[i]
 
-            ctx_plain = safe_decode([t if t != -100 else tokenizer.pad_token_id for t in ex["input_ids"]], tokenizer, skip_special_tokens=False)
-            tgt_plain = safe_decode([t if t != -100 else tokenizer.pad_token_id for t in ex["labels"]], tokenizer, skip_special_tokens=False)
+            ctx_plain = safe_decode(ex["input_ids"], tokenizer, skip_special_tokens=False)
+            tgt_plain = safe_decode(ex["labels"], tokenizer, skip_special_tokens=False)
             
             logging.info(
                 "\n===== SAMPLE {:d} =====\n"
@@ -617,8 +612,8 @@ def main():
             skip_special_tokens = False
 
             generated_text = safe_decode(outputs[0].tolist(), tokenizer, skip_special_tokens=skip_special_tokens)
-            target_text = safe_decode([t if t != -100 else tokenizer.pad_token_id for t in ex["labels"]], tokenizer, skip_special_tokens=skip_special_tokens)
-            context_text = safe_decode([t if t != -100 else tokenizer.pad_token_id for t in ex["input_ids"]], tokenizer, skip_special_tokens=skip_special_tokens)
+            target_text = safe_decode(ex["labels"], tokenizer, skip_special_tokens=skip_special_tokens)
+            context_text = safe_decode(ex["input_ids"], tokenizer, skip_special_tokens=skip_special_tokens)
             
             logger.info(
                 "\n----- 생성 샘플 {:d} -----\n"
