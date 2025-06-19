@@ -5,6 +5,8 @@
 /cache_sasrec
 /cache_dialog_gen
 /cache_dialog_gen_gt_strategy
+/cache_dialog_gen_gt_prefix
+/cache_dialog_gen_cls_prefix
 
 __pycache__
 */__pycache__
