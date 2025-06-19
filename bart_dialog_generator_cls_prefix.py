@@ -7,16 +7,16 @@ BART 모델을 사용하여 대화 맥락과 전략(strategy)을 기반으로 �
 사용법 예시:
 ----------
 # 기본 훈련
-CUDA_VISIBLE_DEVICES=1 python bart_dialog_generator_cls_prefix.py --batch_size 16 --output_dir outputs/dialog_generation_gt_prefix
+CUDA_VISIBLE_DEVICES=1 python bart_dialog_generator_cls_prefix.py --batch_size 16 --output_dir outputs/dialog_generation_cls_prefix
 
 # 작은 비율의 데이터로 빠른 테스트
-CUDA_VISIBLE_DEVICES=1 python bart_dialog_generator_cls_prefix.py --tiny_frac 0.05 --epochs 1 --eval_steps 10 --output_dir outputs/dialog_tiny_gt_prefix
+CUDA_VISIBLE_DEVICES=1 python bart_dialog_generator_cls_prefix.py --tiny_frac 0.05 --epochs 1 --eval_steps 10 --output_dir outputs/dialog_tiny_cls_prefix
 
 # facebook/bart-base 원본 모델 평가
-CUDA_VISIBLE_DEVICES=2 python bart_dialog_generator_cls_prefix.py --eval_only --output_dir outputs/dialog_eval_gt_prefix
+CUDA_VISIBLE_DEVICES=2 python bart_dialog_generator_cls_prefix.py --eval_only --output_dir outputs/dialog_eval_cls_prefix
 
 # 그래디언트 누적을 사용한 대용량 배치 학습 (실효 배치 크기 32)
-CUDA_VISIBLE_DEVICES=3 python bart_dialog_generator_cls_prefix.py --gradient_accumulation_steps 2 --output_dir outputs/dialog_batch_32_gt_prefix
+CUDA_VISIBLE_DEVICES=3 python bart_dialog_generator_cls_prefix.py --gradient_accumulation_steps 2 --output_dir outputs/dialog_batch_32_cls_prefix
 """
 
 from __future__ import annotations
