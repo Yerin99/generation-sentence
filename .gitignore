@@ -6,6 +6,7 @@
 /cache_dialog_gen
 /cache_dialog_gen_gt_strategy
 
+__pycache__
 */__pycache__
 */*/__pycache__
 
