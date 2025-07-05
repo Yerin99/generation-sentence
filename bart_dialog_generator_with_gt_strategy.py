@@ -7,7 +7,7 @@ BART 모델을 사용하여 대화 맥락과 전략(strategy)을 기반으로 �
 사용법 예시:
 ----------
 # 기본 훈련
-CUDA_VISIBLE_DEVICES=2 python bart_dialog_generator_with_gt_strategy.py --batch_size 16 --output_dir outputs/dialog_generation_gt_strategy
+CUDA_VISIBLE_DEVICES=3 python bart_dialog_generator_with_gt_strategy.py --batch_size 16 --output_dir outputs/dialog_generation_gt_strategy
 
 # 작은 비율의 데이터로 빠른 테스트
 CUDA_VISIBLE_DEVICES=1 python bart_dialog_generator_with_gt_strategy.py --tiny_frac 0.05 --epochs 1 --eval_steps 10 --output_dir outputs/dialog_tiny_gt_strategy
@@ -71,8 +71,8 @@ class DialogGenDataset(torch.utils.data.Dataset):
         self,
         split: str,
         tokenizer: BartTokenizer,
-        max_src: int = 512,
-        max_tgt: int = 128,
+        max_src: int = 1024,
+        max_tgt: int = 256,
         tiny_frac: float | None = None,
         cache_dir: str = "cache_dialog_gen_gt_strategy",
         dataset_name: str = "thu-coai/esconv",
